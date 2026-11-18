@@ -1059,8 +1059,10 @@ describe('InterviewOverlay', () => {
     expect(onShortcuts).toHaveBeenCalled()
 
     act(() => {
-      shortcutsListener?.({ askFromServerScreen: { key: 'CommandOrControl+Shift+6' } })
+      shortcutsListener?.({
+        askFromServerScreen: { key: 'CommandOrControl+Shift+9', triggerDescription: 'Ctrl+Alt+6' },
+      })
     })
-    expect(await screen.findByText((text, element) => element?.tagName.toLowerCase() === 'kbd' && /6$/.test(text))).toBeInTheDocument()
+    expect(await screen.findByText('Ctrl+Alt+6')).toBeInTheDocument()
   })
 })

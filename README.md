@@ -266,7 +266,7 @@ interview-assistant/
 
 - **Node / npm 报错**：Electron 桌面模式需要 Node.js `22.12+`。
 - **Electron 下载慢**：可先设置 `ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/`，再进入 `desktop/` 执行 `npm install`。
-- **KDE Wayland**：全局快捷键需要系统 Python 的 PyGObject（`gi`），服务端截图需要 Spectacle。
+- **KDE Wayland**：桌面端通过 D-Bus 接入全局快捷键和 KWin 窗口操作，服务端截图需要 Spectacle。
 - **macOS 下 sounddevice 安装失败**：先执行 `brew install portaudio`。
 - **Whisper 模型下载慢**：可设置 `export HF_ENDPOINT=https://hf-mirror.com`。
 - **中文/术语识别不准（如 RAG 被听错）**：主链路切到 FunASR 并下载模型，配合设置 → 热词里的岗位自定义词；Whisper 用户也可在热词页配置提示偏置。

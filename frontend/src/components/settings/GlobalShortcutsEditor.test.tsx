@@ -95,4 +95,63 @@ describe('GlobalShortcutsEditor', () => {
 
     expect(await screen.findByRole('button', { name: '恢复默认快捷键' })).toBeEnabled()
   })
+
+  it('records and resets KDE bindings in the same editor', async () => {
+    const kdeShortcuts = {
+      ...defaultShortcuts,
+      toggleInterviewOverlay: {
+        ...defaultShortcuts.toggleInterviewOverlay,
+        status: 'registered' as const,
+        triggerDescription: 'Ctrl+Alt+O',
+      },
+    }
+    useShortcutsStore.getState().setShortcuts(kdeShortcuts)
+    const suspended = deferred<{ ok: boolean; suspended: boolean }>()
+    window.electronAPI!.setShortcutsSuspended = vi.fn()
+      .mockReturnValueOnce(suspended.promise)
+      .mockResolvedValue({ ok: true, suspended: false })
+    const edited = {
+      ...kdeShortcuts,
+      toggleInterviewOverlay: { ...kdeShortcuts.toggleInterviewOverlay, triggerDescription: 'Ctrl+Alt+H' },
+    }
+    window.electronAPI!.updateShortcuts = vi.fn().mockResolvedValue({ ok: true, shortcuts: edited })
+    render(<GlobalShortcutsEditor />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Ctrl+Alt+O' }))
+    expect(screen.getByText('已注册')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '准备录键…' })).toBeInTheDocument()
+    const chord = { key: 'h', code: 'KeyH', ctrlKey: true, altKey: true }
+    fireEvent.keyDown(window, chord)
+    expect(window.electronAPI!.updateShortcuts).not.toHaveBeenCalled()
+
+    await act(async () => suspended.resolve({ ok: true, suspended: true }))
+    fireEvent.keyDown(window, chord)
+    await screen.findByRole('button', { name: 'Ctrl+Alt+H' })
+    expect(window.electronAPI!.updateShortcuts).toHaveBeenCalledWith([
+      { action: 'toggleInterviewOverlay', key: 'CommandOrControl+Alt+H' },
+    ])
+    expect(window.electronAPI!.setShortcutsSuspended).toHaveBeenLastCalledWith(false)
+
+    window.electronAPI!.resetShortcuts = vi.fn().mockResolvedValue({
+      ok: true,
+      shortcuts: {
+        ...kdeShortcuts,
+        toggleInterviewOverlay: { ...kdeShortcuts.toggleInterviewOverlay, triggerDescription: 'Ctrl+O' },
+      },
+    })
+    fireEvent.click(screen.getByRole('button', { name: '恢复默认快捷键' }))
+    expect(window.electronAPI!.resetShortcuts).toHaveBeenCalledOnce()
+    expect(await screen.findByRole('button', { name: 'Ctrl+O' })).toBeInTheDocument()
+  })
+
+  it('cancels recording and restores shortcuts when the window loses focus', async () => {
+    window.electronAPI!.setShortcutsSuspended = vi.fn().mockResolvedValue({ ok: true, suspended: true })
+    render(<GlobalShortcutsEditor />)
+    fireEvent.click(screen.getByRole('button', { name: 'Ctrl+B' }))
+    await screen.findByRole('button', { name: '按下新快捷键…' })
+    fireEvent.blur(window)
+    expect(screen.getByRole('button', { name: 'Ctrl+B' })).toBeInTheDocument()
+    expect(window.electronAPI!.setShortcutsSuspended).toHaveBeenLastCalledWith(false)
+    expect(window.electronAPI!.updateShortcuts).not.toHaveBeenCalled()
+  })
 })

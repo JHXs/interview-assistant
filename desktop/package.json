@@ -11,5 +11,8 @@
   },
   "devDependencies": {
     "electron": "44.11.3"
+  },
+  "dependencies": {
+    "dbus-native": "0.16.3"
   }
 }

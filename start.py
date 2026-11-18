@@ -252,13 +252,17 @@ def build_frontend(force: bool = False):
 
 
 def ensure_electron():
-    """Install the locked Electron version when the local copy is stale."""
+    """Install desktop dependencies when a locked package is missing or stale."""
     try:
         with open(os.path.join(DESKTOP_DIR, "package-lock.json"), encoding="utf-8") as f:
-            expected = json.load(f)["packages"]["node_modules/electron"]["version"]
-        with open(os.path.join(DESKTOP_DIR, "node_modules", "electron", "package.json"), encoding="utf-8") as f:
-            if json.load(f)["version"] == expected:
-                return True
+            packages = json.load(f)["packages"]
+        for name in ("electron", *packages[""].get("dependencies", {})):
+            module = f"node_modules/{name}"
+            with open(os.path.join(DESKTOP_DIR, module, "package.json"), encoding="utf-8") as f:
+                if json.load(f)["version"] != packages[module]["version"]:
+                    break
+        else:
+            return True
     except (OSError, ValueError, KeyError):
         pass
 

@@ -5,6 +5,7 @@ const ShortcutStatus = {
   Registered: 'registered',
   Failed: 'failed',
   Available: 'available',
+  Unbound: 'unbound',
 };
 
 const DEFAULT_SHORTCUTS = {

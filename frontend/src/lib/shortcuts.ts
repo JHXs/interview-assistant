@@ -13,7 +13,7 @@ export type ShortcutAction =
   | 'askScreenForceThink'
   | 'askScreenForceNoThink'
   | 'toggleThinkMode'
-export type ShortcutStatus = 'registered' | 'failed' | 'available'
+export type ShortcutStatus = 'registered' | 'failed' | 'available' | 'unbound'
 
 export type ShortcutConfig = {
   action: ShortcutAction
@@ -22,6 +22,7 @@ export type ShortcutConfig = {
   label: string
   category: string
   status?: ShortcutStatus
+  triggerDescription?: string | null
 }
 
 export const defaultShortcuts: Record<ShortcutAction, ShortcutConfig> = {
@@ -183,8 +184,11 @@ const KEY_DISPLAY: Record<string, string> = {
   Up: '↑', Down: '↓', Left: '←', Right: '→',
 }
 
-export function getShortcutDisplay(accelerator: string) {
-  const parts = accelerator.split('+')
+export function getShortcutDisplay(shortcut: ShortcutConfig) {
+  if (shortcut.triggerDescription !== undefined) {
+    return shortcut.triggerDescription ?? '未绑定'
+  }
+  const parts = shortcut.key.split('+')
   const ctrl = isMacPlatform() ? '⌘' : 'Ctrl'
   const shiftSym = isMacPlatform() ? '⇧' : 'Shift'
   const altSym = isMacPlatform() ? '⌥' : 'Alt'
@@ -198,7 +202,7 @@ export function getShortcutDisplay(accelerator: string) {
   return out.join(isMacPlatform() ? '' : '+')
 }
 
-const VALID_ACTIONS = new Set<string>(Object.keys(defaultShortcuts))
+const SHORTCUT_STATUSES = new Set<unknown>(['registered', 'failed', 'available', 'unbound'])
 const SUPPORTED_KEY_RE = /^CommandOrControl(\+Shift)?(\+Alt)?\+([A-Za-z0-9./\\\- =;,'`\[\]\{\}]|Enter|Escape|Up|Down|Left|Right)$/
 
 export function mergeShortcutConfigs(
@@ -206,13 +210,18 @@ export function mergeShortcutConfigs(
 ) {
   const merged = { ...defaultShortcuts }
   for (const [action, shortcut] of Object.entries(input || {})) {
-    if (!(action in merged)) continue
+    if (!Object.prototype.hasOwnProperty.call(defaultShortcuts, action)) continue
     if (!shortcut || typeof shortcut !== 'object') continue
     const s = shortcut as Record<string, unknown>
-    if (typeof s.key === 'string' && s.key.trim() && SUPPORTED_KEY_RE.test(s.key)) {
+    const key = typeof s.key === 'string' ? s.key.trim() : ''
+    if (SUPPORTED_KEY_RE.test(key)) {
       merged[action as ShortcutAction] = {
         ...merged[action as ShortcutAction],
-        key: s.key,
+        key,
+        status: SHORTCUT_STATUSES.has(s.status) ? s.status as ShortcutStatus : undefined,
+        triggerDescription: typeof s.triggerDescription === 'string'
+          ? s.triggerDescription
+          : s.triggerDescription === null ? null : undefined,
       }
     }
   }

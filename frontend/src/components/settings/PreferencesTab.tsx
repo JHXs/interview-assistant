@@ -322,6 +322,7 @@ export default function PreferencesTab({ variant = 'main' }: { variant?: 'main' 
           <div>
             Windows 上通过 <code className="font-mono text-[10px] bg-bg-tertiary/60 px-1 rounded">setContentProtection</code> 可稳定避免被屏幕共享软件截图；
             macOS 15+ 的 <span className="font-mono text-[10px]">ScreenCaptureKit</span> 会绕过保护位，实际效果请以你自己的环境测试为准。
+            KDE Wayland 在支持捕获排除的 KWin 版本上，可通过托盘开关控制主窗口和悬浮窗的屏幕共享隐身。
           </div>
         </div>
         {overlayEnabled && (
@@ -426,16 +427,16 @@ export default function PreferencesTab({ variant = 'main' }: { variant?: 'main' 
             </div>
             <p className="text-[10px] text-text-muted leading-relaxed -mt-1">
               悬浮窗不会抢占焦点,直接用鼠标滚轮即可滚动内容,
-              <kbd className="px-1 py-0.5 bg-bg-hover rounded text-[9px]">{getShortcutDisplay(shortcuts.moveOverlayToMouse?.key ?? 'CommandOrControl+M')}</kbd> 可把窗口一键移到鼠标附近。
+              <kbd className="px-1 py-0.5 bg-bg-hover rounded text-[9px]">{getShortcutDisplay(shortcuts.moveOverlayToMouse)}</kbd> 可把窗口一键移到鼠标附近。
               专注面板打开时,
-              <kbd className="px-1 py-0.5 bg-bg-hover rounded text-[9px]">{getShortcutDisplay(shortcuts.focusPrevTab?.key ?? 'CommandOrControl+Left')}</kbd>
+              <kbd className="px-1 py-0.5 bg-bg-hover rounded text-[9px]">{getShortcutDisplay(shortcuts.focusPrevTab)}</kbd>
               /
-              <kbd className="px-1 py-0.5 bg-bg-hover rounded text-[9px]">{getShortcutDisplay(shortcuts.focusNextTab?.key ?? 'CommandOrControl+Right')}</kbd>
+              <kbd className="px-1 py-0.5 bg-bg-hover rounded text-[9px]">{getShortcutDisplay(shortcuts.focusNextTab)}</kbd>
               切换分区。
               悬浮窗打开时,
-              <kbd className="px-1 py-0.5 bg-bg-hover rounded text-[9px]">{getShortcutDisplay(shortcuts.overlayPrevQuestion?.key ?? 'CommandOrControl+Up')}</kbd>
+              <kbd className="px-1 py-0.5 bg-bg-hover rounded text-[9px]">{getShortcutDisplay(shortcuts.overlayPrevQuestion)}</kbd>
               /
-              <kbd className="px-1 py-0.5 bg-bg-hover rounded text-[9px]">{getShortcutDisplay(shortcuts.overlayNextQuestion?.key ?? 'CommandOrControl+Down')}</kbd>
+              <kbd className="px-1 py-0.5 bg-bg-hover rounded text-[9px]">{getShortcutDisplay(shortcuts.overlayNextQuestion)}</kbd>
               回看上一题/下一题, 不影响当前生成。
             </p>
           </>

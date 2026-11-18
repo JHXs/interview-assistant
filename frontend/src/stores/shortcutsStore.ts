@@ -25,3 +25,21 @@ export const useShortcutsStore = create<ShortcutsState>((set) => ({
     })),
   resetShortcuts: () => set({ shortcuts: defaultShortcuts }),
 }))
+
+export function subscribeToDesktopShortcuts() {
+  const api = window.electronAPI
+  if (!api?.getShortcuts) return
+  const { setShortcuts } = useShortcutsStore.getState()
+  let useSnapshot = true
+  const unsubscribe = api.onShortcuts?.((shortcuts) => {
+    useSnapshot = false
+    setShortcuts(shortcuts)
+  })
+  api.getShortcuts().then((shortcuts) => {
+    if (useSnapshot) setShortcuts(shortcuts)
+  }).catch(() => {})
+  return () => {
+    useSnapshot = false
+    unsubscribe?.()
+  }
+}
