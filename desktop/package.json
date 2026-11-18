@@ -3,12 +3,13 @@
   "version": "1.0.0",
   "description": "智能面试学习辅助助手 - Electron 桌面端",
   "appDisplayName": "智能面试学习辅助助手",
+  "desktopName": "io.github.powAu3.InterviewAssistant.desktop",
   "main": "main.js",
   "scripts": {
     "test": "node --test",
     "start": "electron ."
   },
   "devDependencies": {
-    "electron": "^41.3.0"
+    "electron": "44.11.3"
   }
 }

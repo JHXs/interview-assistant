@@ -45,7 +45,7 @@ def _find_npm() -> str | None:
 
 
 def _print_node_help() -> None:
-    print("[ERROR] 未找到 npm。请先安装 Node.js 18+，然后重新运行 quick-start.py。")
+    print("[ERROR] 未找到 npm。请先安装 Node.js 22.12+，然后重新运行 quick-start.py。")
     print("  下载: https://nodejs.org")
 
 

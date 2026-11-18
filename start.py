@@ -2,6 +2,7 @@
 """Unified launcher for the interview assistant."""
 
 import argparse
+import json
 import os
 import platform
 import shutil
@@ -192,7 +193,7 @@ def _find_npm() -> Optional[str]:
 def _print_node_help():
     system = platform.system()
     print()
-    print("[ERROR] 未找到 Node.js / npm，桌面模式和前端构建需要 Node.js 18+。")
+    print("[ERROR] 未找到 Node.js / npm。桌面模式需要 Node.js 22.12+，前端构建需要 Node.js 18+。")
     print()
     if system == "Windows":
         print("  安装方法（选一种）：")
@@ -251,9 +252,15 @@ def build_frontend(force: bool = False):
 
 
 def ensure_electron():
-    """Make sure desktop/node_modules/electron exists."""
-    if os.path.isdir(os.path.join(DESKTOP_DIR, "node_modules", "electron")):
-        return True
+    """Install the locked Electron version when the local copy is stale."""
+    try:
+        with open(os.path.join(DESKTOP_DIR, "package-lock.json"), encoding="utf-8") as f:
+            expected = json.load(f)["packages"]["node_modules/electron"]["version"]
+        with open(os.path.join(DESKTOP_DIR, "node_modules", "electron", "package.json"), encoding="utf-8") as f:
+            if json.load(f)["version"] == expected:
+                return True
+    except (OSError, ValueError, KeyError):
+        pass
 
     npm = _find_npm()
     if npm is None:
@@ -358,6 +365,7 @@ def run_desktop_mode(port: int):
 
     if not ensure_electron():
         print("[ERROR] Electron 安装失败，请检查网络后重试。")
+        print("  桌面模式需要 Node.js 22.12 或更新版本。")
         print("  手动安装: cd desktop && npm install")
         print()
         print("  或者直接用无 Electron 模式启动:")

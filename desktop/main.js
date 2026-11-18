@@ -3,6 +3,7 @@ const { spawn } = require('child_process');
 const path = require('path');
 const http = require('http');
 const fs = require('fs');
+const os = require('os');
 
 // Windows: 透明 BrowserWindow 需要 DWM 硬件加速。
 // 历史遗留 disableHardwareAcceleration() 已移除 ——
@@ -41,6 +42,7 @@ const {
   createShortcutState,
   loadShortcutConfig,
   saveShortcutConfig,
+  isWaylandShortcutKey,
   validateShortcutMap,
 } = require('./shortcuts');
 const {
@@ -52,6 +54,7 @@ const {
   relayChildOutput,
 } = require('./windowOptions');
 const { createMultiScreenBatch } = require('./multiScreenBatch');
+const { createKdeShortcutSession, moveKdeOverlayToCursor } = require('./kdeWayland');
 
 const pkg = require('./package.json');
 
@@ -76,6 +79,41 @@ function loadAppDisplayName() {
 }
 
 const APP_DISPLAY_NAME = loadAppDisplayName();
+const OVERLAY_WINDOW_TITLE = `${APP_DISPLAY_NAME} Overlay`;
+const isWaylandSession = process.platform === 'linux'
+  && (process.env.XDG_SESSION_TYPE === 'wayland' || Boolean(process.env.WAYLAND_DISPLAY))
+  && app.commandLine.getSwitchValue('ozone-platform') !== 'x11';
+const isKdeWaylandSession = isWaylandSession && (
+  process.env.XDG_CURRENT_DESKTOP?.toLowerCase().split(':').includes('kde')
+  || process.env.KDE_FULL_SESSION === 'true'
+);
+
+function installWaylandDesktopEntry() {
+  const dataHome = process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share');
+  const applications = path.join(dataHome, 'applications');
+  const entry = path.join(applications, pkg.desktopName);
+  const exec = [process.execPath, __dirname].map((value) =>
+    `"${value.replace(/%/g, '%%').replace(/["`$\\]/g, '\\$&').replace(/\\/g, '\\\\')}"`,
+  ).join(' ');
+  const content = [
+    '[Desktop Entry]',
+    'Type=Application',
+    'Name=智能面试学习辅助助手',
+    `Exec=${exec}`,
+    'NoDisplay=true',
+    '',
+  ].join('\n');
+
+  try {
+    if (fs.existsSync(entry) && fs.readFileSync(entry, 'utf8') === content) return;
+    fs.mkdirSync(applications, { recursive: true });
+    fs.writeFileSync(entry, content);
+  } catch (error) {
+    console.warn('[shortcuts] 无法创建 Wayland 应用身份：', error.message);
+  }
+}
+
+if (isWaylandSession) installWaylandDesktopEntry();
 
 const ROOT = path.resolve(__dirname, '..');
 const BACKEND_DIR = path.join(ROOT, 'backend');
@@ -88,12 +126,27 @@ let tray = null;
 let pythonProcess = null;
 let isQuitting = false;
 let shortcuts = {};
+let waylandShortcutRecording = false;
+const kdeShortcutSession = isKdeWaylandSession ? createKdeShortcutSession({
+  app,
+  appId: pkg.desktopName.replace(/\.desktop$/, ''),
+  onBound(actions) {
+    for (const shortcut of Object.values(shortcuts)) {
+      shortcut.status = actions.has(shortcut.action) ? ShortcutStatus.Registered : ShortcutStatus.Failed;
+    }
+    sendShortcutsState();
+  },
+  onActivate(action) {
+    if (!isQuitting && !waylandShortcutRecording && isOverlayShortcutActive(action)) shortcutCallbacks[action]();
+  },
+}) : null;
 let _overlayDragging = false;
 let _blurTimer = null;
 let overlayAutoResizeUntil = 0;
 let overlayPositionSaveTimer = null;
 let overlayPositionSaveForce = false;
 let overlayToggleBlockedUntil = 0;
+let overlayMoveInProgress = false;
 let lastOverlayState = {
   initialized: false,
   enabled: false,
@@ -119,6 +172,7 @@ let _frontReassertTimer = null;
 const FRONT_REASSERT_LEVEL = 1;
 const FOCUS_OVERLAY_SHORTCUT_ACTIONS = new Set(['focusPrevTab', 'focusNextTab']);
 const VISIBLE_OVERLAY_SHORTCUT_ACTIONS = new Set(['cancelAnswer', 'overlayPrevQuestion', 'overlayNextQuestion']);
+const OVERLAY_SHORTCUT_ACTIONS = [...FOCUS_OVERLAY_SHORTCUT_ACTIONS, ...VISIBLE_OVERLAY_SHORTCUT_ACTIONS];
 const FRONT_REASSERT_DURATION = 5000;
 const FRONT_REASSERT_INTERVAL = 500;
 
@@ -420,7 +474,7 @@ function createOverlayWindow() {
     show: false,
     autoHideMenuBar: true,
     roundedCorners: true,
-    title: `${APP_DISPLAY_NAME} Overlay`,
+    title: OVERLAY_WINDOW_TITLE,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -428,6 +482,9 @@ function createOverlayWindow() {
       backgroundThrottling: false,
     },
   });
+  if (isKdeWaylandSession) {
+    overlayWindow.on('page-title-updated', (event) => event.preventDefault());
+  }
 
   // Content protection 必须尽早调用 —— 等到 ready-to-show 时,
   // 窗口可能已经被 window server 登记过一次, 导致 NSWindowSharingNone 漏掉初始帧
@@ -702,24 +759,52 @@ function registerManagedShortcut(shortcut) {
     shortcut.status = ShortcutStatus.Available;
     return false;
   }
-  if (globalShortcut.register(shortcut.key, callback)) {
+  // Recreating a Wayland portal session when the overlay changes can break
+  // every binding. Keep its bindings registered and gate callbacks here.
+  const dispatch = isWaylandSession ? () => {
+    if (!waylandShortcutRecording && isOverlayShortcutActive(shortcut.action)) callback();
+  } : callback;
+  if ((!isWaylandSession || isWaylandShortcutKey(shortcut.key))
+      && globalShortcut.register(shortcut.key, dispatch)) {
     shortcut.status = ShortcutStatus.Registered;
     return true;
   }
   shortcut.status = ShortcutStatus.Failed;
+  console.warn(`[shortcuts] 注册失败：${shortcut.action} (${shortcut.key})`);
   return false;
 }
 
+function bindKdeShortcuts() {
+  const seen = new Set();
+  const entries = [];
+  for (const shortcut of Object.values(shortcuts)) {
+    if (!isWaylandShortcutKey(shortcut.key) || seen.has(shortcut.key)) {
+      shortcut.status = ShortcutStatus.Failed;
+      continue;
+    }
+    seen.add(shortcut.key);
+    shortcut.status = ShortcutStatus.Available;
+    entries.push(shortcut);
+  }
+  kdeShortcutSession.bind(entries);
+  sendShortcutsState();
+}
+
 function registerShortcuts() {
-  shortcuts = loadShortcutConfig(app);
+  shortcuts = loadShortcutConfig(app, isWaylandSession);
+  if (kdeShortcutSession) {
+    bindKdeShortcuts();
+    return;
+  }
   Object.values(shortcuts).forEach((shortcut) => {
-    if (!isOverlayShortcutActive(shortcut.action)) {
+    if (!isWaylandSession && !isOverlayShortcutActive(shortcut.action)) {
       shortcut.status = ShortcutStatus.Available;
       return;
     }
     registerManagedShortcut(shortcut);
   });
-  syncFocusOverlayShortcuts();
+  if (isWaylandSession) sendShortcutsState();
+  else syncFocusOverlayShortcuts();
 }
 
 function unregisterShortcut(action) {
@@ -734,21 +819,13 @@ function unregisterAllManagedShortcuts() {
 }
 
 function syncFocusOverlayShortcuts() {
-  for (const action of FOCUS_OVERLAY_SHORTCUT_ACTIONS) {
+  if (isWaylandSession) return;
+  for (const action of OVERLAY_SHORTCUT_ACTIONS) {
     const shortcut = shortcuts[action];
     if (!shortcut) continue;
     if (isOverlayShortcutActive(action)) {
       if (shortcut.status !== ShortcutStatus.Registered) registerManagedShortcut(shortcut);
-    } else if (shortcut.status === ShortcutStatus.Registered || shortcut.status === ShortcutStatus.Failed) {
-      unregisterShortcut(action);
-    }
-  }
-  for (const action of VISIBLE_OVERLAY_SHORTCUT_ACTIONS) {
-    const shortcut = shortcuts[action];
-    if (!shortcut) continue;
-    if (isOverlayShortcutActive(action)) {
-      if (shortcut.status !== ShortcutStatus.Registered) registerManagedShortcut(shortcut);
-    } else if (shortcut.status === ShortcutStatus.Registered || shortcut.status === ShortcutStatus.Failed) {
+    } else if (shortcut.status !== ShortcutStatus.Available) {
       unregisterShortcut(action);
     }
   }
@@ -762,45 +839,54 @@ function registerShortcutSet(nextShortcuts) {
   }
 
   const prevShortcuts = shortcuts;
-  unregisterAllManagedShortcuts();
+  const updates = Object.values(nextShortcuts).filter((shortcut) =>
+    !isWaylandSession || prevShortcuts[shortcut.action]?.key !== shortcut.key,
+  );
+  if (kdeShortcutSession) {
+    if (updates.length || Object.values(shortcuts).some(({ status }) => status === ShortcutStatus.Failed)) {
+      saveShortcutConfig(app, nextShortcuts);
+      shortcuts = nextShortcuts;
+      bindKdeShortcuts();
+    }
+    return { ok: true, shortcuts };
+  }
+  if (isWaylandSession) {
+    for (const { action } of updates) unregisterShortcut(action);
+    for (const shortcut of Object.values(nextShortcuts)) {
+      const previous = prevShortcuts[shortcut.action];
+      if (previous?.key === shortcut.key) shortcut.status = previous.status;
+    }
+  } else {
+    unregisterAllManagedShortcuts();
+  }
 
-  const nextState = JSON.parse(JSON.stringify(nextShortcuts));
   let failedKey = null;
-  for (const shortcut of Object.values(nextState)) {
-    if (!isOverlayShortcutActive(shortcut.action)) {
+  const registered = [];
+  for (const shortcut of updates) {
+    if (!isWaylandSession && !isOverlayShortcutActive(shortcut.action)) {
       shortcut.status = ShortcutStatus.Available;
       continue;
     }
-    const callback = shortcutCallbacks[shortcut.action];
-    if (!callback) continue;
-    if (globalShortcut.register(shortcut.key, callback)) {
-      shortcut.status = ShortcutStatus.Registered;
-    } else {
-      shortcut.status = ShortcutStatus.Failed;
+    if (!registerManagedShortcut(shortcut)) {
       failedKey = shortcut.key;
       break;
     }
+    registered.push(shortcut);
   }
 
   if (failedKey) {
-    Object.values(nextState).forEach((shortcut) => globalShortcut.unregister(shortcut.key));
-    shortcuts = prevShortcuts;
-    Object.values(shortcuts).forEach((shortcut) => {
-      if (!isOverlayShortcutActive(shortcut.action)) {
-        shortcut.status = ShortcutStatus.Available;
-        return;
-      }
-      const callback = shortcutCallbacks[shortcut.action];
-      if (!callback) return;
-      globalShortcut.register(shortcut.key, callback);
-      shortcut.status = ShortcutStatus.Registered;
-    });
+    for (const { key } of registered) globalShortcut.unregister(key);
+    for (const { action } of updates) {
+      if (isWaylandSession || isOverlayShortcutActive(action)) registerManagedShortcut(prevShortcuts[action]);
+    }
+    sendShortcutsState();
     return { ok: false, error: `快捷键注册失败：${failedKey}`, shortcuts };
   }
 
-  shortcuts = nextState;
-  syncFocusOverlayShortcuts();
+  shortcuts = nextShortcuts;
   saveShortcutConfig(app, shortcuts);
+  if (isWaylandSession) sendShortcutsState();
+  else syncFocusOverlayShortcuts();
   return { ok: true, shortcuts };
 }
 
@@ -903,8 +989,25 @@ const shortcutCallbacks = {
       }
     }
   },
-  moveOverlayToMouse: () => {
-    if (!overlayWindow || overlayWindow.isDestroyed()) return;
+  moveOverlayToMouse: async () => {
+    if (!overlayWindow || overlayWindow.isDestroyed() || !overlayWindow.isVisible()) return;
+    if (isKdeWaylandSession) {
+      if (overlayMoveInProgress) return;
+      overlayMoveInProgress = true;
+      try {
+        await moveKdeOverlayToCursor(OVERLAY_WINDOW_TITLE);
+      } catch (error) {
+        console.warn('[overlay] KWin 移动悬浮窗失败:', error.stderr?.trim() || error.message);
+        notifyDesktopToast('KWin 无法移动悬浮窗', 'error');
+      } finally {
+        overlayMoveInProgress = false;
+      }
+      return;
+    }
+    if (isWaylandSession) {
+      notifyDesktopToast('当前 Wayland 桌面不支持移动悬浮窗到鼠标位置', 'error');
+      return;
+    }
     const cursor = screen.getCursorScreenPoint();
     const offsetX = 20;
     const offsetY = 20;
@@ -941,19 +1044,14 @@ ipcMain.handle('update-shortcuts', (_event, updates) => {
   for (const update of updates || []) {
     if (!update || typeof update.action !== 'string' || typeof update.key !== 'string') continue;
     if (!next[update.action]) continue;
+    if (isWaylandSession && !isWaylandShortcutKey(update.key)) {
+      return { ok: false, error: `Wayland 不支持此全局快捷键：${update.key}`, shortcuts };
+    }
     next[update.action].key = update.key;
   }
-  const result = registerShortcutSet(next);
-  if (result.ok) sendShortcutsState();
-  return result;
+  return registerShortcutSet(next);
 });
-ipcMain.handle('reset-shortcuts', () => {
-  try { fs.unlinkSync(path.join(app.getPath('userData'), 'shortcuts.json')); } catch {}
-  const defaults = createShortcutState();
-  const result = registerShortcutSet(defaults);
-  if (result.ok) sendShortcutsState();
-  return result;
-});
+ipcMain.handle('reset-shortcuts', () => registerShortcutSet(createShortcutState({}, isWaylandSession)));
 ipcMain.handle('toggle-always-on-top', () => {
   if (!mainWindow) return false;
   const next = !mainWindow.isAlwaysOnTop();
@@ -1072,6 +1170,11 @@ ipcMain.handle('set-shortcuts-suspended', (_event, on) => {
   // 设置页正在录制新快捷键时暂停全部全局热键：否则按下的组合键会
   // 触发旧绑定（Ctrl+B 藏主窗口 / Ctrl+. 清空会话），录制 UI 直接被带走。
   const suspend = on === true;
+  if (isWaylandSession) {
+    // Keep existing portal bindings alive while recording a different key.
+    waylandShortcutRecording = suspend;
+    return { ok: true, suspended: suspend };
+  }
   try {
     if (suspend) {
       unregisterAllManagedShortcuts();
@@ -1273,7 +1376,10 @@ app.on('activate', () => {
 });
 
 app.on('will-quit', () => {
-  globalShortcut.unregisterAll();
+  kdeShortcutSession?.stop();
+  // The Wayland portal releases this process's shortcuts on D-Bus disconnect.
+  // Unregistering them individually during teardown can start another request.
+  if (!isWaylandSession) globalShortcut.unregisterAll();
   if (overlayPositionSaveTimer) {
     clearTimeout(overlayPositionSaveTimer);
     overlayPositionSaveTimer = null;

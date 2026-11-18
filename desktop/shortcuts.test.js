@@ -3,11 +3,13 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { portalBinding } = require('./kdeWayland');
 
 const {
   createShortcutState,
   getShortcutsFilePath,
   isValidShortcutKey,
+  isWaylandShortcutKey,
   loadShortcutConfig,
   saveShortcutConfig,
   validateShortcutMap,
@@ -97,4 +99,31 @@ test('default think shortcuts are valid and unique', () => {
   assert.equal(isValidShortcutKey(shortcuts.toggleThinkMode.key), true);
   const result = validateShortcutMap(shortcuts);
   assert.equal(result.ok, true);
+});
+
+test('Wayland uses distinct portal-compatible defaults and preserves saved custom keys', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ia-shortcuts-'));
+  const app = makeFakeApp(tmpDir);
+  saveShortcutConfig(app, createShortcutState({
+    toggleInterviewOverlay: { key: 'CommandOrControl+Shift+J' },
+  }));
+
+  const shortcuts = loadShortcutConfig(app, true);
+  assert.equal(shortcuts.hideOrShowWindow.key, 'CommandOrControl+B');
+  assert.equal(shortcuts.askFromServerScreen.key, 'CommandOrControl+K');
+  assert.equal(shortcuts.toggleInterviewOverlay.key, 'CommandOrControl+Shift+J');
+  assert.ok(Object.values(shortcuts).every(({ key }) => isWaylandShortcutKey(key)));
+  assert.equal(validateShortcutMap(shortcuts).ok, true);
+
+  saveShortcutConfig(app, shortcuts);
+  assert.equal(loadShortcutConfig(app).askFromServerScreen.key, 'CommandOrControl+/');
+});
+
+test('KDE can reuse Chromium bindings for existing keys with punctuation', () => {
+  const profileId = '12345678-1234-1234-1234-123456789abc';
+  assert.deepEqual(portalBinding('CommandOrControl+Alt+.', profileId), {
+    id: 'ABDF5BD351B97290C58CDE7FEDEA713F-Ctrl+Alt+Period',
+    trigger: 'CTRL+ALT+period',
+  });
+  assert.equal(portalBinding('CommandOrControl+Up', profileId).trigger, 'CTRL+Up');
 });
