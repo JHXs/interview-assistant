@@ -1,7 +1,7 @@
 import type { OverlayStatePayload } from '@/lib/interviewOverlay'
 
 type DesktopShortcuts = Record<string, Record<string, unknown>>
-type ShortcutUpdateResult = { ok: boolean; error?: string; shortcuts: DesktopShortcuts }
+type ShortcutUpdateResult = { ok: true; warning?: string } | { ok: false; error?: string }
 
 export {}
 

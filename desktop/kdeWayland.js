@@ -18,6 +18,11 @@ const SCRIPTING = 'org.kde.kwin.Scripting';
 const RESULT_INTERFACE = 'io.github.powAu3.InterviewAssistant.WindowResult';
 const RESULT_PATH = '/io/github/powAu3/InterviewAssistant/WindowResult';
 
+function isKdeDesktop() {
+  return process.env.XDG_CURRENT_DESKTOP?.toLowerCase().split(':').includes('kde')
+    || process.env.KDE_FULL_SESSION === 'true';
+}
+
 function openSessionBus() {
   const bus = sessionBus({ timeout: 5000 });
   bus.connection.on('error', () => { void bus.close(); });
@@ -51,7 +56,8 @@ function portalBinding(key, profileId) {
   };
 }
 
-function getProfileId(userData, appId) {
+// Electron's private preference is only used to reproduce IDs for existing KDE bindings.
+function getLegacyProfileId(userData, appId) {
   try {
     const preferences = JSON.parse(readFileSync(join(userData, 'Preferences'), 'utf8'));
     return preferences.electron?.global_shortcuts?.uuid || appId;
@@ -174,13 +180,16 @@ async function changeKdeShortcuts(bus, appId, entries, requested) {
   }
 }
 
-function createKdeShortcutSession({ app, appId, onBound, onActivate }) {
+function createKdeShortcutSession({ app, appId, onBound, onActivate, openBus = openSessionBus }) {
   let profileId;
   let current;
+  let latestSession;
   let pendingUpdate = Promise.resolve();
   let closing = Promise.resolve();
+  let recording = false;
+  let recordingRequest;
 
-  function stop() {
+  function disconnect() {
     const previous = current;
     current = undefined;
     previous?.controller.abort();
@@ -188,8 +197,13 @@ function createKdeShortcutSession({ app, appId, onBound, onActivate }) {
     return closing;
   }
 
+  function stop() {
+    latestSession = undefined;
+    return disconnect();
+  }
+
   function queueUpdate(update) {
-    const state = current;
+    const state = latestSession;
     const result = pendingUpdate.then(() => {
       if (state !== current) throw new Error('KDE 快捷键会话已关闭');
       return update(state);
@@ -199,7 +213,7 @@ function createKdeShortcutSession({ app, appId, onBound, onActivate }) {
   }
 
   async function suspendShortcuts(state, next) {
-    if (next === (state?.suspended ?? false)) return;
+    if (next === (state ? state.suspended : false)) return;
     if (!state?.refreshBindings) throw new Error('KDE 快捷键尚未注册，请稍后重试');
     const ids = state.entries.map(entry => kdeActionId(appId, entry));
     // Autoload + SetPresent restores KDE's saved keys without writing new assignments.
@@ -209,9 +223,11 @@ function createKdeShortcutSession({ app, appId, onBound, onActivate }) {
     const failure = results.find(result => result.status === 'rejected');
     if (state !== current) throw new Error('KDE 快捷键会话已关闭');
     if (failure) {
+      // A failed batch leaves some bindings in an unknown state.
+      state.suspended = null;
       if (next) {
         const restored = await Promise.allSettled(ids.map(resume));
-        state.suspended = restored.some(result => result.status === 'rejected');
+        if (restored.every(result => result.status === 'fulfilled')) state.suspended = false;
       }
       throw failure.reason;
     }
@@ -229,51 +245,75 @@ function createKdeShortcutSession({ app, appId, onBound, onActivate }) {
       }
       await suspendShortcuts(state, false);
       await changeKdeShortcuts(bus, appId, entries, requested);
-      await refreshBindings();
+      try {
+        await refreshBindings();
+        return true;
+      } catch (error) {
+        // KDE has already committed the verified keys. Retry only the Portal readback.
+        if (state === current) {
+          console.warn('[shortcuts] KDE 快捷键已保存，刷新失败:', error.message);
+          void queueUpdate(() => refreshBindings()).catch(() => {});
+        }
+        return false;
+      }
     });
   }
 
-  return {
-    async bind(shortcuts) {
-      // Disconnecting releases the old Portal session before a new bind.
-      const previous = stop();
-      const state = current = { controller: new AbortController(), suspended: false };
-      await previous;
-      if (state !== current || !shortcuts.length) return;
+  async function bind(shortcuts) {
+    // Disconnecting releases the old Portal session before a new bind.
+    const previous = disconnect();
+    const state = current = { controller: new AbortController(), suspended: false, shortcuts };
+    latestSession = state;
+    onBound(null);
+    await previous;
+    if (state !== current || !shortcuts.length) return;
 
-      function finish(error) {
-        if (state !== current) return;
-        if (error) console.warn('[shortcuts]', error.message);
-        const disconnected = stop();
-        onBound(new Map());
-        return disconnected;
-      }
+    function finish(error) {
+      if (state !== current) return;
+      if (error) console.warn('[shortcuts]', error.message);
+      const disconnected = disconnect();
+      onBound(new Map());
+      return disconnected;
+    }
 
-      try {
-        const bus = state.bus = openSessionBus();
-        bus.connection.once('close', error => { void finish(error); });
-        profileId ??= getProfileId(app.getPath('userData'), appId);
-        const usedKeys = new Set();
-        state.entries = shortcuts.map(({ action, key, label, defaultKey }) => {
-          const accelerator = key.trim();
-          // Legacy duplicate or unsupported keys still need an ID so they can be edited or reset.
-          const binding = isWaylandShortcutKey(accelerator) && !usedKeys.has(accelerator)
-            ? portalBinding(accelerator, profileId) : { id: action };
-          usedKeys.add(accelerator);
-          return { action, label, defaultKey, ...binding };
-        });
-        state.refreshBindings = await bindPortalShortcuts(bus, appId, state.entries,
-          bindings => { if (state === current) onBound(bindings); },
-          action => { if (state === current) onActivate(action); },
-          state.controller.signal);
-      } catch (error) {
-        await finish(error);
+    try {
+      const bus = state.bus = openBus();
+      bus.connection.once('close', error => { void finish(error); });
+      profileId ??= getLegacyProfileId(app.getPath('userData'), appId);
+      const usedKeys = new Set();
+      state.entries = shortcuts.map(({ action, key, label, defaultKey }) => {
+        const accelerator = key.trim();
+        // Legacy duplicate or unsupported keys still need an ID so they can be edited or reset.
+        const binding = isWaylandShortcutKey(accelerator) && !usedKeys.has(accelerator)
+          ? portalBinding(accelerator, profileId) : { id: action };
+        usedKeys.add(accelerator);
+        return { action, label, defaultKey, ...binding };
+      });
+      state.refreshBindings = await bindPortalShortcuts(bus, appId, state.entries,
+        bindings => { if (state === current) onBound(bindings); },
+        action => { if (state === current && !recording) onActivate(action); },
+        state.controller.signal);
+    } catch (error) {
+      await finish(error);
+    }
+  }
+
+  function setSuspended(next) {
+    const state = latestSession;
+    recording = next;
+    const request = queueUpdate(state => suspendShortcuts(state, next));
+    recordingRequest = request;
+    return request.catch(error => {
+      if (recordingRequest === request) {
+        recording = false;
+        // A disconnect clears the active session but leaves its bindings available for recovery.
+        if (state && state === latestSession && (!next || !current)) void bind(state.shortcuts);
       }
-    },
-    setSuspended: next => queueUpdate(state => suspendShortcuts(state, next)),
-    updateShortcuts,
-    stop,
-  };
+      throw error;
+    });
+  }
+
+  return { bind, setSuspended, updateShortcuts, stop };
 }
 
 async function runKdeWindowScript(title, operation) {
@@ -332,33 +372,164 @@ async function runKdeWindowScript(title, operation) {
         await call(bus, owner, '/Scripting', SCRIPTING, 'unloadScript', 's', [basename(directory)]).catch(() => {});
       }
     } finally {
-      await bus.close();
-      if (directory) await rm(directory, { recursive: true, force: true });
+      try {
+        await bus.close();
+      } finally {
+        if (directory) await rm(directory, { recursive: true, force: true });
+      }
     }
   }
 }
 
-function moveKdeOverlayToCursor(title) {
-  return runKdeWindowScript(title, `
-    const cursor = workspace.cursorPos;
-    const { width, height } = window.frameGeometry;
-    window.frameGeometry = {
-      x: Math.round(cursor.x - 20), y: Math.round(cursor.y - 20), width, height,
-    };
-    return true;
-  `);
-}
+function createKdeWindowController({ onStateChanged, onError, runWindowScript = runKdeWindowScript }) {
+  const windows = new Map();
+  let mainKeepAbove = null;
+  let captureProtectionSupported = true;
+  let captureProtectionRequested = true;
+  let pendingUpdate = Promise.resolve();
+  let movingOverlay = false;
 
-function setKdeWindowFlags(title, flags) {
-  return runKdeWindowScript(title, `
-    const actual = {};
-    for (const [flag, enabled] of Object.entries(${JSON.stringify(flags)})) {
-      const supported = typeof window[flag] === 'boolean';
-      if (supported && enabled !== null) window[flag] = enabled;
-      actual[flag] = supported ? window[flag] : null;
+  function queueUpdate(update) {
+    // KWin can reuse script IDs when loads and unloads overlap.
+    const result = pendingUpdate.then(update);
+    pendingUpdate = result.catch(() => {});
+    return result;
+  }
+
+  function isVisible(state) {
+    return state && windows.get(state.role) === state && !state.win.isDestroyed() && state.win.isVisible();
+  }
+
+  async function applyFlags(state, flags) {
+    if (!isVisible(state)) return;
+    const revision = state.revision;
+    try {
+      const actual = await runWindowScript(state.title, `
+        const actual = {};
+        for (const [flag, enabled] of Object.entries(${JSON.stringify(flags)})) {
+          const supported = typeof window[flag] === 'boolean';
+          if (supported && enabled !== null) window[flag] = enabled;
+          actual[flag] = supported ? window[flag] : null;
+        }
+        return actual;
+      `);
+      if (windows.get(state.role) !== state || state.win.isDestroyed()) return;
+      // A confirmed pin belongs to the window, while capture status belongs to its visible surface.
+      if (state.role === 'main' && typeof actual.keepAbove === 'boolean') mainKeepAbove = actual.keepAbove;
+      if (state.revision !== revision || !state.win.isVisible()) return;
+      if ('excludeFromCapture' in actual) {
+        captureProtectionSupported = actual.excludeFromCapture !== null;
+        state.excludeFromCapture = actual.excludeFromCapture;
+      }
+      if (Object.entries(flags).some(([flag, requested]) =>
+        requested !== null && typeof actual[flag] === 'boolean' && actual[flag] !== requested)) {
+        onError('KWin 窗口规则限制了本次设置');
+      }
+    } catch (error) {
+      if (!isVisible(state) || state.revision !== revision) return;
+      if ('excludeFromCapture' in flags) state.excludeFromCapture = undefined;
+      console.warn('[window] KWin 无法设置窗口属性:', error.message);
+      onError('KWin 无法设置窗口属性');
     }
-    return actual;
-  `);
+  }
+
+  function trackWindow(win, role, title) {
+    const state = { win, role, title, revision: 0, excludeFromCapture: undefined };
+    windows.set(role, state);
+    // The KWin script uses the fixed title and PID to identify the window.
+    win.on('page-title-updated', event => event.preventDefault());
+    win.on('show', () => {
+      const revision = ++state.revision;
+      state.excludeFromCapture = undefined;
+      void queueUpdate(async () => {
+        if (state.revision !== revision) return;
+        const flags = { keepAbove: role === 'main' ? mainKeepAbove : true };
+        if (captureProtectionSupported) flags.excludeFromCapture = captureProtectionRequested;
+        await applyFlags(state, flags);
+        onStateChanged();
+      });
+    });
+    win.on('hide', () => {
+      state.revision++;
+      onStateChanged();
+    });
+    win.on('closed', () => {
+      if (windows.get(role) === state) windows.delete(role);
+      onStateChanged();
+    });
+  }
+
+  function isMainWindowAlwaysOnTop() {
+    const state = windows.get('main');
+    return Boolean(state && !state.win.isDestroyed() && mainKeepAbove);
+  }
+
+  function setMainWindowAlwaysOnTop(enabled) {
+    return queueUpdate(async () => {
+      const state = windows.get('main');
+      if (state && !state.win.isDestroyed()) {
+        const next = enabled ?? !isMainWindowAlwaysOnTop();
+        if (isVisible(state)) await applyFlags(state, { keepAbove: next });
+        else mainKeepAbove = next;
+      }
+      onStateChanged();
+      return isMainWindowAlwaysOnTop();
+    });
+  }
+
+  function isCaptureProtectionActive() {
+    if (!captureProtectionSupported) return false;
+    const visible = [...windows.values()].filter(isVisible);
+    if (!visible.length) return captureProtectionRequested;
+    return visible.every(state => state.excludeFromCapture === true);
+  }
+
+  function setCaptureProtection(enabled) {
+    return queueUpdate(async () => {
+      if (!captureProtectionSupported) return false;
+      captureProtectionRequested = enabled ?? !isCaptureProtectionActive();
+      for (const state of [...windows.values()]) {
+        if (!captureProtectionSupported) break;
+        await applyFlags(state, { excludeFromCapture: captureProtectionRequested });
+      }
+      onStateChanged();
+      return isCaptureProtectionActive();
+    });
+  }
+
+  async function moveOverlayToCursor() {
+    const state = windows.get('overlay');
+    if (!isVisible(state) || movingOverlay) return;
+    movingOverlay = true;
+    try {
+      await queueUpdate(async () => {
+        if (!isVisible(state)) return;
+        await runWindowScript(state.title, `
+          const cursor = workspace.cursorPos;
+          const { width, height } = window.frameGeometry;
+          window.frameGeometry = {
+            x: Math.round(cursor.x - 20), y: Math.round(cursor.y - 20), width, height,
+          };
+          return true;
+        `);
+      });
+    } catch (error) {
+      console.warn('[overlay] KWin 移动悬浮窗失败:', error.message);
+      onError('KWin 无法移动悬浮窗');
+    } finally {
+      movingOverlay = false;
+    }
+  }
+
+  return {
+    trackWindow,
+    isMainWindowAlwaysOnTop,
+    setMainWindowAlwaysOnTop,
+    isCaptureProtectionSupported: () => captureProtectionSupported,
+    isCaptureProtectionActive,
+    setCaptureProtection,
+    moveOverlayToCursor,
+  };
 }
 
-module.exports = { createKdeShortcutSession, moveKdeOverlayToCursor, setKdeWindowFlags, portalBinding };
+module.exports = { createKdeShortcutSession, createKdeWindowController, isKdeDesktop, portalBinding };

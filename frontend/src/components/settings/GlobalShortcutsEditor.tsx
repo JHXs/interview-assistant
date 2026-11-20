@@ -3,7 +3,6 @@ import { Section } from './shared'
 import { useInterviewStore } from '@/stores/configStore'
 import { useShortcutsStore } from '@/stores/shortcutsStore'
 import {
-  defaultShortcuts,
   getShortcutAccelerator,
   getShortcutDisplay,
   type ShortcutAction,
@@ -13,7 +12,6 @@ type RecordingPhase = 'preparing' | 'ready' | 'saving'
 
 export default function GlobalShortcutsEditor() {
   const shortcuts = useShortcutsStore((s) => s.shortcuts)
-  const setShortcuts = useShortcutsStore((s) => s.setShortcuts)
   const [recordingAction, setRecordingAction] = useState<ShortcutAction | null>(null)
   const [recordingPhase, setRecordingPhase] = useState<RecordingPhase>('preparing')
   const [resetting, setResetting] = useState(false)
@@ -46,12 +44,9 @@ export default function GlobalShortcutsEditor() {
         const res = await api.updateShortcuts([
           { action: recordingAction, key: accelerator },
         ])
-        if (!res.ok) {
-          useInterviewStore.getState().setToastMessage(res.error || '快捷键保存失败')
-        } else {
-          setShortcuts(res.shortcuts)
-          useInterviewStore.getState().setToastMessage('快捷键已更新')
-        }
+        useInterviewStore.getState().setToastMessage(
+          res.ok === true ? res.warning || '快捷键已更新' : res.error || '快捷键保存失败',
+        )
       } catch (err) {
         useInterviewStore.getState().setToastMessage(err instanceof Error ? err.message : '快捷键保存失败')
       } finally {
@@ -78,11 +73,10 @@ export default function GlobalShortcutsEditor() {
       window.removeEventListener('blur', cancel)
       void api?.setShortcutsSuspended?.(false).catch(() => {})
     }
-  }, [recordingAction, setShortcuts])
+  }, [recordingAction])
 
   if (!window.electronAPI?.getShortcuts) return null
 
-  const items = Object.keys(defaultShortcuts) as ShortcutAction[]
   const saving = Boolean(recordingAction) && recordingPhase === 'saving'
 
   const resetDefaults = async () => {
@@ -92,12 +86,9 @@ export default function GlobalShortcutsEditor() {
     setResetting(true)
     try {
       const res = await window.electronAPI.resetShortcuts()
-      if (!res.ok) {
-        useInterviewStore.getState().setToastMessage(res.error || '重置失败')
-      } else {
-        setShortcuts(res.shortcuts)
-        useInterviewStore.getState().setToastMessage('已恢复默认快捷键')
-      }
+      useInterviewStore.getState().setToastMessage(
+        res.ok === true ? res.warning || '已恢复默认快捷键' : res.error || '重置失败',
+      )
     } catch (err) {
       useInterviewStore.getState().setToastMessage(err instanceof Error ? err.message : '重置失败')
     } finally {
@@ -126,9 +117,8 @@ export default function GlobalShortcutsEditor() {
         支持字母、数字、方向键等。点击某项后按新快捷键，<code className="px-1 py-0.5 rounded bg-bg-tertiary border border-bg-hover font-mono text-[11px]">Esc</code> 取消。系统或其他应用占用的组合键可能无法录入。
       </div>
       <div className="space-y-2">
-        {items.map((action) => {
-          const shortcut = shortcuts[action]
-          if (!shortcut) return null
+        {Object.values(shortcuts).map((shortcut) => {
+          const { action } = shortcut
           const isRecording = recordingAction === action
           return (
             <div

@@ -43,7 +43,7 @@ beforeEach(() => {
   apiMock.cancelAsk.mockResolvedValue({ ok: true })
   apiMock.clear.mockResolvedValue({ ok: true })
   delete (window as unknown as { electronAPI?: unknown }).electronAPI
-  useShortcutsStore.getState().resetShortcuts()
+  useShortcutsStore.setState(useShortcutsStore.getInitialState())
   useInterviewStore.setState({
     qaPairs: [qa],
     streamingIds: [],
