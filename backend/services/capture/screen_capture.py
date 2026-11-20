@@ -1,4 +1,5 @@
-"""本机主显示器截图：在独立子进程中执行，尽量不抢前台焦点（配合关闭该接口的 access 日志）。
+"""本机显示器截图：在独立子进程中执行，尽量不抢前台焦点。
+KDE Wayland 截取当前显示器，其它受支持平台截取主显示器。
 区域由配置 screen_capture_region 决定：full / left_half / right_half / top_half / bottom_half。"""
 
 from __future__ import annotations
@@ -44,7 +45,7 @@ def _capture_payload_to_data_url(raw: str) -> str:
 
 def capture_primary_region_data_url(region: str = "left_half", max_long_edge: int = 1600) -> str:
     """
-    在子进程内截取主显示器指定区域，返回 data:image/png;base64,...
+    在子进程内截取当前显示器（KDE Wayland）或主显示器的指定区域，返回图片 data URL。
     region: full | left_half | right_half | top_half | bottom_half
     - Windows: CREATE_NO_WINDOW，不弹出控制台
     - 与主进程分离 session，降低终端/IDE 因本进程图形调用被抢焦点的概率
@@ -86,10 +87,10 @@ def capture_primary_region_data_url(region: str = "left_half", max_long_edge: in
             raise ScreenCaptureError("缺少依赖 mss，请执行: pip install mss")
         if proc.returncode == 3:
             raise ScreenCaptureError("未检测到可用显示器（无图形界面或远程无头环境无法截屏）")
-        raise ScreenCaptureError(
-            "截屏失败。macOS 请在「隐私与安全性 → 屏幕录制」中允许运行后端的终端或 Python。"
-            f" 详情: {err}"
-        )
+        hint = ""
+        if sys.platform == "darwin":
+            hint = "请在「隐私与安全性 → 屏幕录制」中允许运行后端的终端或 Python。"
+        raise ScreenCaptureError(f"截屏失败。{hint} 详情: {err}")
 
     raw = (proc.stdout or b"").decode("ascii", errors="strict").strip()
     if len(raw) < 100:

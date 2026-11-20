@@ -5,6 +5,7 @@ const ShortcutStatus = {
   Registered: 'registered',
   Failed: 'failed',
   Available: 'available',
+  Unbound: 'unbound',
 };
 
 const DEFAULT_SHORTCUTS = {
@@ -117,16 +118,26 @@ const SUPPORTED_KEYS = new Set([
   'Up', 'Down', 'Left', 'Right',
 ]);
 
-function createShortcutState(overrides = {}) {
+// Electron's Wayland Portal shares a command ID for Escape and most punctuation.
+const WAYLAND_DEFAULT_KEYS = {
+  askFromServerScreen: 'CommandOrControl+K',
+  cancelAnswer: 'CommandOrControl+Shift+X',
+  addMultiServerScreenShot: 'CommandOrControl+Shift+K',
+  askScreenForceThink: 'CommandOrControl+Alt+K',
+};
+
+function createShortcutState(overrides = {}, wayland = false) {
   return Object.fromEntries(
-    Object.entries(DEFAULT_SHORTCUTS).map(([action, shortcut]) => [
-      action,
-      {
+    Object.entries(DEFAULT_SHORTCUTS).map(([action, shortcut]) => {
+      const defaultKey = (wayland && WAYLAND_DEFAULT_KEYS[action]) || shortcut.key;
+      return [action, {
         ...shortcut,
+        key: defaultKey,
+        defaultKey,
         status: ShortcutStatus.Available,
         ...overrides[action],
-      },
-    ]),
+      }];
+    }),
   );
 }
 
@@ -147,6 +158,10 @@ function isValidShortcutKey(key) {
   return modifierKey === '' || modifierKey === 'Shift' || modifierKey === 'Alt' || modifierKey === 'Shift+Alt';
 }
 
+function isWaylandShortcutKey(key) {
+  return isValidShortcutKey(key) && /^(?:[A-Z0-9.,]|Up|Down|Left|Right)$/.test(key.trim().split('+').at(-1));
+}
+
 function validateShortcutMap(shortcuts) {
   const seen = new Set();
   for (const shortcut of Object.values(shortcuts)) {
@@ -161,14 +176,20 @@ function validateShortcutMap(shortcuts) {
   return { ok: true };
 }
 
-function loadShortcutConfig(app) {
-  const shortcuts = createShortcutState();
+function loadShortcutConfig(app, wayland = false) {
+  const shortcuts = createShortcutState({}, wayland);
   const filePath = getShortcutsFilePath(app);
   try {
     if (!fs.existsSync(filePath)) return shortcuts;
     const raw = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    const savedKeys = new Set(Object.keys(shortcuts).map((action) => raw?.[action]?.key));
     for (const [action, shortcut] of Object.entries(shortcuts)) {
       const nextKey = raw?.[action]?.key;
+      if (wayland && WAYLAND_DEFAULT_KEYS[action]
+          && (!isValidShortcutKey(nextKey) || nextKey === DEFAULT_SHORTCUTS[action].key)) {
+        if (savedKeys.has(shortcut.defaultKey)) shortcut.key = DEFAULT_SHORTCUTS[action].key;
+        continue;
+      }
       if (isValidShortcutKey(nextKey)) {
         shortcut.key = nextKey;
       }
@@ -186,7 +207,7 @@ function saveShortcutConfig(app, shortcuts) {
   const payload = Object.fromEntries(
     Object.entries(shortcuts).map(([action, shortcut]) => [
       action,
-      { key: shortcut.key },
+      { key: shortcut.key === shortcut.defaultKey ? DEFAULT_SHORTCUTS[action].key : shortcut.key },
     ]),
   );
   fs.writeFileSync(filePath, JSON.stringify(payload, null, 2), 'utf8');
@@ -198,6 +219,7 @@ module.exports = {
   createShortcutState,
   getShortcutsFilePath,
   isValidShortcutKey,
+  isWaylandShortcutKey,
   loadShortcutConfig,
   saveShortcutConfig,
   validateShortcutMap,

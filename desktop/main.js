@@ -4,6 +4,7 @@ const path = require('path');
 const http = require('http');
 const net = require('net');
 const fs = require('fs');
+const os = require('os');
 
 // Windows: 透明 BrowserWindow 需要 DWM 硬件加速。
 // 历史遗留 disableHardwareAcceleration() 已移除 ——
@@ -42,6 +43,7 @@ const {
   createShortcutState,
   loadShortcutConfig,
   saveShortcutConfig,
+  isWaylandShortcutKey,
   validateShortcutMap,
 } = require('./shortcuts');
 const {
@@ -53,6 +55,7 @@ const {
   relayChildOutput,
 } = require('./windowOptions');
 const { createMultiScreenBatch } = require('./multiScreenBatch');
+const { createKdeShortcutSession, createKdeWindowController, isKdeDesktop } = require('./kdeWayland');
 
 const pkg = require('./package.json');
 
@@ -77,6 +80,39 @@ function loadAppDisplayName() {
 }
 
 const APP_DISPLAY_NAME = loadAppDisplayName();
+const OVERLAY_WINDOW_TITLE = `${APP_DISPLAY_NAME} Overlay`;
+const isWaylandSession = process.platform === 'linux'
+  && (process.env.XDG_SESSION_TYPE === 'wayland' || Boolean(process.env.WAYLAND_DISPLAY))
+  && app.commandLine.getSwitchValue('ozone-platform') !== 'x11';
+const isKdeWaylandSession = isWaylandSession && isKdeDesktop();
+const hasNativeCaptureProtection = process.platform === 'win32' || process.platform === 'darwin';
+
+function installWaylandDesktopEntry() {
+  const dataHome = process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share');
+  const applications = path.join(dataHome, 'applications');
+  const entry = path.join(applications, pkg.desktopName);
+  const exec = [process.execPath, __dirname].map((value) =>
+    `"${value.replace(/%/g, '%%').replace(/["`$\\]/g, '\\$&').replace(/\\/g, '\\\\')}"`,
+  ).join(' ');
+  const content = [
+    '[Desktop Entry]',
+    'Type=Application',
+    'Name=智能面试学习辅助助手',
+    `Exec=${exec}`,
+    'NoDisplay=true',
+    '',
+  ].join('\n');
+
+  try {
+    if (fs.existsSync(entry) && fs.readFileSync(entry, 'utf8') === content) return;
+    fs.mkdirSync(applications, { recursive: true });
+    fs.writeFileSync(entry, content);
+  } catch (error) {
+    console.warn('[shortcuts] 无法创建 Wayland 应用身份：', error.message);
+  }
+}
+
+if (isWaylandSession) installWaylandDesktopEntry();
 
 const ROOT = app.isPackaged ? process.resourcesPath : path.resolve(__dirname, '..');
 let PORT = parseInt(process.env.PORT || '18080', 10);
@@ -96,9 +132,32 @@ app.on('second-instance', () => {
 let mainWindow = null;
 let overlayWindow = null;
 let tray = null;
+let trayMenu = null;
+let nativeCaptureProtectionRequested = hasNativeCaptureProtection;
+const kdeWindows = isKdeWaylandSession ? createKdeWindowController({
+  onStateChanged: refreshWindowMenu,
+  onError: message => notifyDesktopToast(message, 'error'),
+}) : null;
 let pythonProcess = null;
 let isQuitting = false;
 let shortcuts = {};
+let waylandShortcutRecording = false;
+const kdeShortcutSession = isKdeWaylandSession ? createKdeShortcutSession({
+  app,
+  appId: pkg.desktopName.replace(/\.desktop$/, ''),
+  onBound(bindings) {
+    for (const shortcut of Object.values(shortcuts)) {
+      shortcut.triggerDescription = bindings?.get(shortcut.action) ?? null;
+      if (!bindings) shortcut.status = ShortcutStatus.Available;
+      else if (!bindings.has(shortcut.action)) shortcut.status = ShortcutStatus.Failed;
+      else shortcut.status = shortcut.triggerDescription ? ShortcutStatus.Registered : ShortcutStatus.Unbound;
+    }
+    sendShortcutsState();
+  },
+  onActivate(action) {
+    if (!isQuitting && isOverlayShortcutActive(action)) shortcutCallbacks[action]();
+  },
+}) : null;
 let _overlayDragging = false;
 let _blurTimer = null;
 let overlayAutoResizeUntil = 0;
@@ -130,13 +189,14 @@ let _frontReassertTimer = null;
 const FRONT_REASSERT_LEVEL = 1;
 const FOCUS_OVERLAY_SHORTCUT_ACTIONS = new Set(['focusPrevTab', 'focusNextTab']);
 const VISIBLE_OVERLAY_SHORTCUT_ACTIONS = new Set(['cancelAnswer', 'overlayPrevQuestion', 'overlayNextQuestion']);
+const OVERLAY_SHORTCUT_ACTIONS = [...FOCUS_OVERLAY_SHORTCUT_ACTIONS, ...VISIBLE_OVERLAY_SHORTCUT_ACTIONS];
 const FRONT_REASSERT_DURATION = 5000;
 const FRONT_REASSERT_INTERVAL = 500;
 
 function applyTopMost(win) {
   if (!win || win.isDestroyed()) return;
   win.setAlwaysOnTop(true, 'screen-saver', FRONT_REASSERT_LEVEL);
-  win.setContentProtection(true);
+  applyNativeCaptureProtection(win);
   win.moveTop();
 }
 
@@ -153,6 +213,60 @@ function keepWindowInFront(win) {
     }
     applyTopMost(win);
   }, FRONT_REASSERT_INTERVAL);
+}
+
+function isMainWindowAlwaysOnTop() {
+  if (kdeWindows) return kdeWindows.isMainWindowAlwaysOnTop();
+  if (!mainWindow || mainWindow.isDestroyed()) return false;
+  return !isWaylandSession && mainWindow.isAlwaysOnTop();
+}
+
+function applyNativeCaptureProtection(win) {
+  if (hasNativeCaptureProtection) win.setContentProtection(nativeCaptureProtectionRequested);
+}
+
+function isWindowVisible(win) {
+  return win && !win.isDestroyed() && win.isVisible();
+}
+
+function isCaptureProtectionActive() {
+  if (kdeWindows) return kdeWindows.isCaptureProtectionActive();
+  if (!hasNativeCaptureProtection) return false;
+  const visible = [mainWindow, overlayWindow].filter(isWindowVisible);
+  return visible.length ? visible.every(win => win.isContentProtected()) : nativeCaptureProtectionRequested;
+}
+
+function isCaptureProtectionSupported() {
+  return kdeWindows?.isCaptureProtectionSupported() ?? hasNativeCaptureProtection;
+}
+
+function refreshWindowMenu() {
+  if (!trayMenu || tray.isDestroyed()) return;
+  trayMenu.getMenuItemById('always-on-top').checked = isMainWindowAlwaysOnTop();
+  const captureItem = trayMenu.getMenuItemById('capture-protection');
+  captureItem.checked = isCaptureProtectionActive();
+  captureItem.enabled = isCaptureProtectionSupported();
+  if (process.platform === 'linux') tray.setContextMenu(trayMenu);
+}
+
+async function setMainWindowAlwaysOnTop(enabled) {
+  if (kdeWindows) return kdeWindows.setMainWindowAlwaysOnTop(enabled);
+  if (!isWaylandSession && mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.setAlwaysOnTop(enabled ?? !isMainWindowAlwaysOnTop(), 'floating');
+  }
+  refreshWindowMenu();
+  return isMainWindowAlwaysOnTop();
+}
+
+async function updateCaptureProtection(enabled) {
+  if (kdeWindows) return kdeWindows.setCaptureProtection(enabled);
+  if (!hasNativeCaptureProtection) return false;
+  nativeCaptureProtectionRequested = enabled ?? !isCaptureProtectionActive();
+  for (const win of [mainWindow, overlayWindow]) {
+    if (win && !win.isDestroyed()) applyNativeCaptureProtection(win);
+  }
+  refreshWindowMenu();
+  return isCaptureProtectionActive();
 }
 
 function getOverlayStateFilePath() {
@@ -418,7 +532,8 @@ function createWindow() {
     },
   });
 
-  mainWindow.setContentProtection(true);
+  applyNativeCaptureProtection(mainWindow);
+  kdeWindows?.trackWindow(mainWindow, 'main', APP_DISPLAY_NAME);
   const sendMaximizedState = () => {
     mainWindow.webContents.send('window-maximized', mainWindow.isMaximized());
   };
@@ -478,12 +593,12 @@ function createOverlayWindow() {
     fullscreenable: false,
     focusable: false,
     skipTaskbar: true,
-    alwaysOnTop: true,
+    alwaysOnTop: !isWaylandSession,
     hiddenInMissionControl: true,
     show: false,
     autoHideMenuBar: true,
     roundedCorners: true,
-    title: `${APP_DISPLAY_NAME} Overlay`,
+    title: OVERLAY_WINDOW_TITLE,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -491,12 +606,12 @@ function createOverlayWindow() {
       backgroundThrottling: false,
     },
   });
-
   // Content protection 必须尽早调用 —— 等到 ready-to-show 时,
   // 窗口可能已经被 window server 登记过一次, 导致 NSWindowSharingNone 漏掉初始帧
-  overlayWindow.setContentProtection(true);
+  applyNativeCaptureProtection(overlayWindow);
+  kdeWindows?.trackWindow(overlayWindow, 'overlay', OVERLAY_WINDOW_TITLE);
   overlayWindow.setBackgroundColor('#00000000');
-  overlayWindow.setAlwaysOnTop(true, 'screen-saver', FRONT_REASSERT_LEVEL);
+  if (!isWaylandSession) overlayWindow.setAlwaysOnTop(true, 'screen-saver', FRONT_REASSERT_LEVEL);
   overlayWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true, skipTransformProcessType: true });
   if (process.platform === 'darwin') {
     // macOS: NSWindowCollectionBehaviorCanJoinAllSpaces + Transient
@@ -510,15 +625,15 @@ function createOverlayWindow() {
 
   overlayWindow.once('ready-to-show', () => {
     if (!overlayWindow || overlayWindow.isDestroyed()) return;
-    overlayWindow.setContentProtection(true);
+    applyNativeCaptureProtection(overlayWindow);
     overlayWindow.setBackgroundColor('#00000000');
     overlayWindow.setFocusable(false);
-    overlayWindow.setAlwaysOnTop(true, 'screen-saver', FRONT_REASSERT_LEVEL);
+    if (!isWaylandSession) overlayWindow.setAlwaysOnTop(true, 'screen-saver', FRONT_REASSERT_LEVEL);
   });
   overlayWindow.loadURL(`${SERVER_URL}?overlay=1`);
   overlayWindow.webContents.on('did-finish-load', () => {
     if (!overlayWindow || overlayWindow.isDestroyed()) return;
-    overlayWindow.setContentProtection(true);
+    applyNativeCaptureProtection(overlayWindow);
     overlayWindow.setBackgroundColor('#00000000');
     overlayWindow.setFocusable(false);
     if (lastOverlayState) {
@@ -534,7 +649,7 @@ function createOverlayWindow() {
   });
   overlayWindow.on('show', () => {
     if (!overlayWindow || overlayWindow.isDestroyed()) return;
-    overlayWindow.setContentProtection(true);
+    applyNativeCaptureProtection(overlayWindow);
     overlayWindow.setBackgroundColor('#00000000');
     overlayWindow.setFocusable(false);
   });
@@ -593,8 +708,8 @@ function showOverlayWindow() {
   } else {
     overlayWindow.show();
   }
-  overlayWindow.setContentProtection(true);
-  keepWindowInFront(overlayWindow);
+  applyNativeCaptureProtection(overlayWindow);
+  if (!isWaylandSession) keepWindowInFront(overlayWindow);
 }
 
 function toggleWindow() {
@@ -717,31 +832,35 @@ function createTray() {
   tray = new Tray(icon);
   tray.setToolTip(APP_DISPLAY_NAME);
 
-  const contextMenu = Menu.buildFromTemplate([
+  trayMenu = Menu.buildFromTemplate([
     { label: '显示窗口', click: () => { mainWindow?.show(); mainWindow?.focus(); } },
     { label: '隐藏到托盘', click: () => toggleWindow() },
     { type: 'separator' },
     {
       label: '窗口置顶',
+      id: 'always-on-top',
       type: 'checkbox',
-      checked: false,
+      checked: isMainWindowAlwaysOnTop(),
+      enabled: !isWaylandSession || isKdeWaylandSession,
       click: (menuItem) => {
-        mainWindow?.setAlwaysOnTop(menuItem.checked, 'floating');
+        void setMainWindowAlwaysOnTop(menuItem.checked);
       },
     },
     {
       label: '屏幕共享隐身',
+      id: 'capture-protection',
       type: 'checkbox',
-      checked: true,
+      checked: isCaptureProtectionActive(),
+      enabled: isCaptureProtectionSupported(),
       click: (menuItem) => {
-        mainWindow?.setContentProtection(menuItem.checked);
+        void updateCaptureProtection(menuItem.checked);
       },
     },
     { type: 'separator' },
     { label: '退出', click: () => { isQuitting = true; app.quit(); } },
   ]);
 
-  tray.setContextMenu(contextMenu);
+  tray.setContextMenu(trayMenu);
   tray.on('click', () => { mainWindow?.show(); mainWindow?.focus(); });
   // Windows 双击托盘图标也能显示
   tray.on('double-click', () => { mainWindow?.show(); mainWindow?.focus(); });
@@ -765,24 +884,36 @@ function registerManagedShortcut(shortcut) {
     shortcut.status = ShortcutStatus.Available;
     return false;
   }
-  if (globalShortcut.register(shortcut.key, callback)) {
+  // Recreating a Wayland portal session when the overlay changes can break
+  // every binding. Keep its bindings registered and gate callbacks here.
+  const dispatch = isWaylandSession ? () => {
+    if (!waylandShortcutRecording && isOverlayShortcutActive(shortcut.action)) callback();
+  } : callback;
+  if ((!isWaylandSession || isWaylandShortcutKey(shortcut.key))
+      && globalShortcut.register(shortcut.key, dispatch)) {
     shortcut.status = ShortcutStatus.Registered;
     return true;
   }
   shortcut.status = ShortcutStatus.Failed;
+  console.warn(`[shortcuts] 注册失败：${shortcut.action} (${shortcut.key})`);
   return false;
 }
 
 function registerShortcuts() {
-  shortcuts = loadShortcutConfig(app);
+  shortcuts = loadShortcutConfig(app, isWaylandSession);
+  if (kdeShortcutSession) {
+    void kdeShortcutSession.bind(Object.values(shortcuts));
+    return;
+  }
   Object.values(shortcuts).forEach((shortcut) => {
-    if (!isOverlayShortcutActive(shortcut.action)) {
+    if (!isWaylandSession && !isOverlayShortcutActive(shortcut.action)) {
       shortcut.status = ShortcutStatus.Available;
       return;
     }
     registerManagedShortcut(shortcut);
   });
-  syncFocusOverlayShortcuts();
+  if (isWaylandSession) sendShortcutsState();
+  else syncFocusOverlayShortcuts();
 }
 
 function unregisterShortcut(action) {
@@ -797,21 +928,13 @@ function unregisterAllManagedShortcuts() {
 }
 
 function syncFocusOverlayShortcuts() {
-  for (const action of FOCUS_OVERLAY_SHORTCUT_ACTIONS) {
+  if (isWaylandSession) return;
+  for (const action of OVERLAY_SHORTCUT_ACTIONS) {
     const shortcut = shortcuts[action];
     if (!shortcut) continue;
     if (isOverlayShortcutActive(action)) {
       if (shortcut.status !== ShortcutStatus.Registered) registerManagedShortcut(shortcut);
-    } else if (shortcut.status === ShortcutStatus.Registered || shortcut.status === ShortcutStatus.Failed) {
-      unregisterShortcut(action);
-    }
-  }
-  for (const action of VISIBLE_OVERLAY_SHORTCUT_ACTIONS) {
-    const shortcut = shortcuts[action];
-    if (!shortcut) continue;
-    if (isOverlayShortcutActive(action)) {
-      if (shortcut.status !== ShortcutStatus.Registered) registerManagedShortcut(shortcut);
-    } else if (shortcut.status === ShortcutStatus.Registered || shortcut.status === ShortcutStatus.Failed) {
+    } else if (shortcut.status !== ShortcutStatus.Available) {
       unregisterShortcut(action);
     }
   }
@@ -821,50 +944,48 @@ function syncFocusOverlayShortcuts() {
 function registerShortcutSet(nextShortcuts) {
   const validation = validateShortcutMap(nextShortcuts);
   if (!validation.ok) {
-    return { ok: false, error: validation.error, shortcuts };
+    return { ok: false, error: validation.error };
   }
 
   const prevShortcuts = shortcuts;
-  unregisterAllManagedShortcuts();
+  const updates = [];
+  for (const shortcut of Object.values(nextShortcuts)) {
+    const previous = prevShortcuts[shortcut.action];
+    if (isWaylandSession && previous?.key === shortcut.key) {
+      shortcut.status = previous.status;
+    } else {
+      updates.push(shortcut);
+      unregisterShortcut(shortcut.action);
+    }
+  }
 
-  const nextState = JSON.parse(JSON.stringify(nextShortcuts));
   let failedKey = null;
-  for (const shortcut of Object.values(nextState)) {
-    if (!isOverlayShortcutActive(shortcut.action)) {
+  const registered = [];
+  for (const shortcut of updates) {
+    if (!isWaylandSession && !isOverlayShortcutActive(shortcut.action)) {
       shortcut.status = ShortcutStatus.Available;
       continue;
     }
-    const callback = shortcutCallbacks[shortcut.action];
-    if (!callback) continue;
-    if (globalShortcut.register(shortcut.key, callback)) {
-      shortcut.status = ShortcutStatus.Registered;
-    } else {
-      shortcut.status = ShortcutStatus.Failed;
+    if (!registerManagedShortcut(shortcut)) {
       failedKey = shortcut.key;
       break;
     }
+    registered.push(shortcut);
   }
 
   if (failedKey) {
-    Object.values(nextState).forEach((shortcut) => globalShortcut.unregister(shortcut.key));
-    shortcuts = prevShortcuts;
-    Object.values(shortcuts).forEach((shortcut) => {
-      if (!isOverlayShortcutActive(shortcut.action)) {
-        shortcut.status = ShortcutStatus.Available;
-        return;
-      }
-      const callback = shortcutCallbacks[shortcut.action];
-      if (!callback) return;
-      globalShortcut.register(shortcut.key, callback);
-      shortcut.status = ShortcutStatus.Registered;
-    });
-    return { ok: false, error: `快捷键注册失败：${failedKey}`, shortcuts };
+    for (const { key } of registered) globalShortcut.unregister(key);
+    for (const { action } of updates) {
+      if (isWaylandSession || isOverlayShortcutActive(action)) registerManagedShortcut(prevShortcuts[action]);
+    }
+    sendShortcutsState();
+    return { ok: false, error: `快捷键注册失败：${failedKey}` };
   }
 
-  shortcuts = nextState;
-  syncFocusOverlayShortcuts();
+  shortcuts = nextShortcuts;
   saveShortcutConfig(app, shortcuts);
-  return { ok: true, shortcuts };
+  sendShortcutsState();
+  return { ok: true };
 }
 
 const shortcutCallbacks = {
@@ -966,8 +1087,14 @@ const shortcutCallbacks = {
       }
     }
   },
-  moveOverlayToMouse: () => {
-    if (!overlayWindow || overlayWindow.isDestroyed()) return;
+  moveOverlayToMouse: async () => {
+    if (kdeWindows) return kdeWindows.moveOverlayToCursor();
+    const win = overlayWindow;
+    if (!isWindowVisible(win)) return;
+    if (isWaylandSession) {
+      notifyDesktopToast('当前 Wayland 桌面不支持移动悬浮窗到鼠标位置', 'error');
+      return;
+    }
     const cursor = screen.getCursorScreenPoint();
     const offsetX = 20;
     const offsetY = 20;
@@ -1005,42 +1132,42 @@ ipcMain.handle('toggle-maximize-window', () => {
 ipcMain.handle('quit-app', () => { isQuitting = true; app.quit(); });
 ipcMain.handle('show-window', () => { mainWindow?.show(); mainWindow?.focus(); });
 ipcMain.handle('get-shortcuts', () => shortcuts);
-ipcMain.handle('update-shortcuts', (_event, updates) => {
-  const next = JSON.parse(JSON.stringify(shortcuts));
-  for (const update of updates || []) {
-    if (!update || typeof update.action !== 'string' || typeof update.key !== 'string') continue;
-    if (!next[update.action]) continue;
-    next[update.action].key = update.key;
+
+async function updateKdeShortcutSettings(updates) {
+  try {
+    const refreshed = await kdeShortcutSession.updateShortcuts(updates);
+    return refreshed ? { ok: true } : { ok: true, warning: '快捷键已保存，显示状态待刷新' };
+  } catch (error) {
+    return { ok: false, error: error.message };
   }
-  const result = registerShortcutSet(next);
-  if (result.ok) sendShortcutsState();
-  return result;
+}
+
+ipcMain.handle('update-shortcuts', (_event, updates) => {
+  if (!Array.isArray(updates)) return { ok: false, error: '无效的快捷键设置' };
+  const requested = [];
+  for (const update of updates) {
+    const { action, key } = update ?? {};
+    if (typeof action !== 'string' || typeof key !== 'string' || !Object.hasOwn(shortcuts, action)) continue;
+    const accelerator = key.trim();
+    if (isWaylandSession && !isWaylandShortcutKey(accelerator)) {
+      return { ok: false, error: `Wayland 不支持此全局快捷键：${key}` };
+    }
+    requested.push([action, accelerator]);
+  }
+  if (kdeShortcutSession) return updateKdeShortcutSettings(requested);
+  const next = structuredClone(shortcuts);
+  for (const [action, key] of requested) next[action].key = key;
+  return registerShortcutSet(next);
 });
-ipcMain.handle('reset-shortcuts', () => {
-  try { fs.unlinkSync(path.join(app.getPath('userData'), 'shortcuts.json')); } catch {}
-  const defaults = createShortcutState();
-  const result = registerShortcutSet(defaults);
-  if (result.ok) sendShortcutsState();
-  return result;
-});
-ipcMain.handle('toggle-always-on-top', () => {
-  if (!mainWindow) return false;
-  const next = !mainWindow.isAlwaysOnTop();
-  mainWindow.setAlwaysOnTop(next, 'floating');
-  return next;
-});
-ipcMain.handle('toggle-content-protection', () => {
-  if (!mainWindow) return true;
-  const webContents = mainWindow.webContents;
-  const isProtected = mainWindow._contentProtection !== false;
-  mainWindow._contentProtection = !isProtected;
-  mainWindow.setContentProtection(!isProtected);
-  return !isProtected;
-});
+ipcMain.handle('reset-shortcuts', () => kdeShortcutSession
+  ? updateKdeShortcutSettings()
+  : registerShortcutSet(createShortcutState({}, isWaylandSession)));
+ipcMain.handle('toggle-always-on-top', () => setMainWindowAlwaysOnTop());
+ipcMain.handle('toggle-content-protection', () => updateCaptureProtection());
 ipcMain.handle('get-window-state', () => ({
   maximized: mainWindow?.isMaximized() ?? false,
-  alwaysOnTop: mainWindow?.isAlwaysOnTop() ?? false,
-  contentProtection: mainWindow?._contentProtection !== false,
+  alwaysOnTop: isMainWindowAlwaysOnTop(),
+  contentProtection: isCaptureProtectionActive(),
   visible: mainWindow?.isVisible() ?? false,
 }));
 ipcMain.handle('sync-overlay-window', (_event, payload = {}) => {
@@ -1138,10 +1265,22 @@ ipcMain.handle('sync-overlay-window', (_event, payload = {}) => {
   return { ok: true, visible: true };
 });
 ipcMain.handle('get-overlay-state', () => lastOverlayState);
-ipcMain.handle('set-shortcuts-suspended', (_event, on) => {
+ipcMain.handle('set-shortcuts-suspended', async (_event, on) => {
   // 设置页正在录制新快捷键时暂停全部全局热键：否则按下的组合键会
   // 触发旧绑定（Ctrl+B 藏主窗口 / Ctrl+. 清空会话），录制 UI 直接被带走。
   const suspend = on === true;
+  if (kdeShortcutSession) {
+    try {
+      await kdeShortcutSession.setSuspended(suspend);
+      return { ok: true, suspended: suspend };
+    } catch (error) {
+      return { ok: false, suspended: false, error: error.message };
+    }
+  }
+  if (isWaylandSession) {
+    waylandShortcutRecording = suspend;
+    return { ok: true, suspended: suspend };
+  }
   try {
     if (suspend) {
       unregisterAllManagedShortcuts();
@@ -1360,7 +1499,10 @@ app.on('activate', () => {
 });
 
 app.on('will-quit', () => {
-  globalShortcut.unregisterAll();
+  kdeShortcutSession?.stop();
+  // The Wayland portal releases this process's shortcuts on D-Bus disconnect.
+  // Unregistering them individually during teardown can start another request.
+  if (!isWaylandSession) globalShortcut.unregisterAll();
   if (overlayPositionSaveTimer) {
     clearTimeout(overlayPositionSaveTimer);
     overlayPositionSaveTimer = null;

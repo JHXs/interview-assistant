@@ -10,7 +10,7 @@ import {
 } from '@/lib/interviewOverlay'
 import { getShortcutDisplay } from '@/lib/shortcuts'
 import { useInterviewStore } from '@/stores/configStore'
-import { useShortcutsStore } from '@/stores/shortcutsStore'
+import { subscribeToDesktopShortcuts, useShortcutsStore } from '@/stores/shortcutsStore'
 import { useUiPrefsStore } from '@/stores/uiPrefsStore'
 
 type FocusTabPane = {
@@ -49,7 +49,6 @@ export default function InterviewOverlay() {
   const config = useInterviewStore((s) => s.config)
   const setConfig = useInterviewStore((s) => s.setConfig)
   const shortcuts = useShortcutsStore((s) => s.shortcuts)
-  const setShortcuts = useShortcutsStore((s) => s.setShortcuts)
   const isExamMode = config?.written_exam_mode === true
   const enabled = useUiPrefsStore((s) => s.interviewOverlayEnabled)
   const opacity = useUiPrefsStore((s) => s.interviewOverlayOpacity)
@@ -194,11 +193,7 @@ export default function InterviewOverlay() {
     window.electronAPI?.resizeOverlayWindow?.({ width: nextWidth, height: nextHeight })?.catch(() => {})
   }, [activeVisionVerifyKey, answerText, enabled, fontSize, hasContent, maxLines, overlayMode, overlayAnswerSlice.text, overlayPromptMaxWidth, overlayVisible])
 
-  const refreshShortcuts = useCallback(() => {
-    window.electronAPI?.getShortcuts?.()
-      .then((nextShortcuts) => { setShortcuts(nextShortcuts) })
-      .catch(() => {})
-  }, [setShortcuts])
+  useEffect(subscribeToDesktopShortcuts, [])
 
   useEffect(() => {
     document.documentElement.classList.add('overlay-window')
@@ -225,7 +220,6 @@ export default function InterviewOverlay() {
     window.electronAPI?.getOverlayState?.()
       .then((payload) => { if (payload) applyState(payload) })
       .catch((error) => { warnInterviewOverlaySyncIssue('bootstrap overlay state', error) })
-    refreshShortcuts()
 
     const onStorage = (event: StorageEvent) => {
       if (!event.key || event.key === COLOR_SCHEME_STORAGE_KEY) applyStoredColorSchemeToDocument()
@@ -233,13 +227,11 @@ export default function InterviewOverlay() {
     }
     window.addEventListener('storage', onStorage)
     const removeOverlayListener = window.electronAPI?.onOverlayState?.((payload) => { applyState(payload) })
-    const removeShortcutsListener = window.electronAPI?.onShortcuts?.((nextShortcuts) => { setShortcuts(nextShortcuts) })
     return () => {
       window.removeEventListener('storage', onStorage)
       removeOverlayListener?.()
-      removeShortcutsListener?.()
     }
-  }, [applyState, refreshShortcuts, setShortcuts, syncPrefs])
+  }, [applyState, syncPrefs])
 
   const suppressMouseSelection = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
     event.preventDefault()
@@ -397,10 +389,10 @@ export default function InterviewOverlay() {
     '--ov-prompt-max-width': `${Math.max(164, overlayPromptMaxWidth - 20)}px`,
   } as CSSProperties
   const focusTools = [
-    { key: 'screen' as const, label: '截图审题', shortcut: shortcuts.askFromServerScreen?.key },
-    { key: 'cancel' as const, label: '取消生成', shortcut: shortcuts.cancelAnswer?.key },
-    { key: 'clear' as const, label: '清空重来', shortcut: shortcuts.hardClearSession?.key },
-    { key: 'hide' as const, label: '隐藏面板', shortcut: shortcuts.toggleInterviewOverlay?.key },
+    { key: 'screen' as const, label: '截图审题', shortcut: shortcuts.askFromServerScreen },
+    { key: 'cancel' as const, label: '取消生成', shortcut: shortcuts.cancelAnswer },
+    { key: 'clear' as const, label: '清空重来', shortcut: shortcuts.hardClearSession },
+    { key: 'hide' as const, label: '隐藏面板', shortcut: shortcuts.toggleInterviewOverlay },
   ]
 
   const renderedAnswer = hasContent ? (
@@ -461,8 +453,8 @@ export default function InterviewOverlay() {
             ))}
             <span className="ov-focus-tab-keys" aria-hidden>
               <span>切换分区</span>
-              <kbd>{getShortcutDisplay(shortcuts.focusPrevTab?.key ?? 'CommandOrControl+Left')}</kbd>
-              <kbd>{getShortcutDisplay(shortcuts.focusNextTab?.key ?? 'CommandOrControl+Right')}</kbd>
+              <kbd>{getShortcutDisplay(shortcuts.focusPrevTab)}</kbd>
+              <kbd>{getShortcutDisplay(shortcuts.focusNextTab)}</kbd>
             </span>
           </div>
           {displayedQa && (
@@ -476,8 +468,8 @@ export default function InterviewOverlay() {
               )}
               <span aria-hidden>
                 <span className="ov-focus-key-label">切换题目</span>
-                <kbd>{getShortcutDisplay(shortcuts.overlayPrevQuestion?.key ?? 'CommandOrControl+Up')}</kbd>
-                <kbd>{getShortcutDisplay(shortcuts.overlayNextQuestion?.key ?? 'CommandOrControl+Down')}</kbd>
+                <kbd>{getShortcutDisplay(shortcuts.overlayPrevQuestion)}</kbd>
+                <kbd>{getShortcutDisplay(shortcuts.overlayNextQuestion)}</kbd>
               </span>
             </div>
           )}

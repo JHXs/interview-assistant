@@ -43,7 +43,7 @@ beforeEach(() => {
   apiMock.cancelAsk.mockResolvedValue({ ok: true })
   apiMock.clear.mockResolvedValue({ ok: true })
   delete (window as unknown as { electronAPI?: unknown }).electronAPI
-  useShortcutsStore.getState().resetShortcuts()
+  useShortcutsStore.setState(useShortcutsStore.getInitialState())
   useInterviewStore.setState({
     qaPairs: [qa],
     streamingIds: [],
@@ -1059,8 +1059,10 @@ describe('InterviewOverlay', () => {
     expect(onShortcuts).toHaveBeenCalled()
 
     act(() => {
-      shortcutsListener?.({ askFromServerScreen: { key: 'CommandOrControl+Shift+6' } })
+      shortcutsListener?.({
+        askFromServerScreen: { key: 'CommandOrControl+Shift+9', triggerDescription: 'Ctrl+Alt+6' },
+      })
     })
-    expect(await screen.findByText((text, element) => element?.tagName.toLowerCase() === 'kbd' && /6$/.test(text))).toBeInTheDocument()
+    expect(await screen.findByText('Ctrl+Alt+6')).toBeInTheDocument()
   })
 })

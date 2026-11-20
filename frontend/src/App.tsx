@@ -3,7 +3,7 @@ import { Settings, SlidersHorizontal, MonitorSmartphone, PanelLeftClose, PanelLe
 import { useShallow } from 'zustand/react/shallow'
 import { useInterviewStore, type AppConfig } from '@/stores/configStore'
 import { useUiPrefsStore } from '@/stores/uiPrefsStore'
-import { useShortcutsStore } from '@/stores/shortcutsStore'
+import { subscribeToDesktopShortcuts } from '@/stores/shortcutsStore'
 import { useInterviewWS } from '@/hooks/useInterviewWS'
 import { useAppBootstrap } from '@/hooks/useAppBootstrap'
 import { useOverlayWindowSync } from '@/hooks/useOverlayWindowSync'
@@ -119,12 +119,7 @@ export default function App() {
     lastMobileStreamingIdRef.current = currentStreamingId
   }, [currentStreamingId, isExamMode])
 
-  useEffect(() => {
-    if (!window.electronAPI?.getShortcuts) return
-    window.electronAPI.getShortcuts()
-      .then((shortcuts) => useShortcutsStore.getState().setShortcuts(shortcuts))
-      .catch(() => {})
-  }, [])
+  useEffect(subscribeToDesktopShortcuts, [])
 
   // Desktop main-process shortcuts (think toggle / force think) push toast + config
   // updates over IPC because POST /api/config does not broadcast over WS.

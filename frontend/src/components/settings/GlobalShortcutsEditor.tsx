@@ -3,75 +3,81 @@ import { Section } from './shared'
 import { useInterviewStore } from '@/stores/configStore'
 import { useShortcutsStore } from '@/stores/shortcutsStore'
 import {
-  defaultShortcuts,
   getShortcutAccelerator,
   getShortcutDisplay,
   type ShortcutAction,
 } from '@/lib/shortcuts'
 
+type RecordingPhase = 'preparing' | 'ready' | 'saving'
+
 export default function GlobalShortcutsEditor() {
   const shortcuts = useShortcutsStore((s) => s.shortcuts)
-  const setShortcuts = useShortcutsStore((s) => s.setShortcuts)
   const [recordingAction, setRecordingAction] = useState<ShortcutAction | null>(null)
-  const [savingAction, setSavingAction] = useState<ShortcutAction | null>(null)
+  const [recordingPhase, setRecordingPhase] = useState<RecordingPhase>('preparing')
   const [resetting, setResetting] = useState(false)
-  const savingShortcutRef = useRef(false)
   const resettingRef = useRef(false)
 
   useEffect(() => {
-    if (!window.electronAPI?.getShortcuts) return
-    window.electronAPI.getShortcuts()
-      .then((next) => setShortcuts(next))
-      .catch(() => {})
-  }, [setShortcuts])
-
-  // 录制新键时暂停 OS 级全局热键：否则按下旧组合会触发真实动作
-  // （Ctrl+B 藏主窗口 / Ctrl+. 清空会话），录制界面直接被带走。
-  useEffect(() => {
-    if (!recordingAction || !window.electronAPI?.setShortcutsSuspended) return
-    void window.electronAPI.setShortcutsSuspended(true)
-    return () => { void window.electronAPI?.setShortcutsSuspended?.(false) }
-  }, [recordingAction])
-
-  useEffect(() => {
     if (!recordingAction) return
+    const api = window.electronAPI
+    let active = true
+    let phase: RecordingPhase = 'preparing'
+    const setPhase = (next: RecordingPhase) => {
+      phase = next
+      setRecordingPhase(next)
+    }
+    const cancel = () => {
+      if (phase !== 'saving') setRecordingAction(null)
+    }
     const handleKeyDown = async (e: KeyboardEvent) => {
       e.preventDefault()
       e.stopPropagation()
-      if (savingShortcutRef.current) return
       if (e.key === 'Escape') {
-        setRecordingAction(null)
+        cancel()
         return
       }
+      if (phase !== 'ready') return
       const accelerator = getShortcutAccelerator(e)
-      if (!accelerator || !window.electronAPI?.updateShortcuts) return
-      savingShortcutRef.current = true
-      setSavingAction(recordingAction)
+      if (!accelerator || !api?.updateShortcuts) return
+      setPhase('saving')
       try {
-        const res = await window.electronAPI.updateShortcuts([
+        const res = await api.updateShortcuts([
           { action: recordingAction, key: accelerator },
         ])
-        if (!res.ok) {
-          useInterviewStore.getState().setToastMessage(res.error || '快捷键保存失败')
-        } else {
-          setShortcuts(res.shortcuts as Record<string, any>)
-          useInterviewStore.getState().setToastMessage('快捷键已更新')
-        }
+        useInterviewStore.getState().setToastMessage(
+          res.ok === true ? res.warning || '快捷键已更新' : res.error || '快捷键保存失败',
+        )
       } catch (err) {
         useInterviewStore.getState().setToastMessage(err instanceof Error ? err.message : '快捷键保存失败')
       } finally {
-        savingShortcutRef.current = false
-        setSavingAction(null)
-        setRecordingAction(null)
+        if (active) setRecordingAction(null)
       }
     }
     window.addEventListener('keydown', handleKeyDown, true)
-    return () => window.removeEventListener('keydown', handleKeyDown, true)
-  }, [recordingAction, setShortcuts])
+    window.addEventListener('blur', cancel)
+    if (api?.setShortcutsSuspended) {
+      api.setShortcutsSuspended(true).then((result) => {
+        if (!result.ok) throw new Error(result.error || '无法开始录制快捷键')
+        if (active) setPhase('ready')
+      }).catch((error) => {
+        if (!active) return
+        cancel()
+        useInterviewStore.getState().setToastMessage(error instanceof Error ? error.message : '无法开始录制快捷键')
+      })
+    } else {
+      setPhase('ready')
+    }
+    return () => {
+      active = false
+      window.removeEventListener('keydown', handleKeyDown, true)
+      window.removeEventListener('blur', cancel)
+      void api?.setShortcutsSuspended?.(false).catch(() => {})
+    }
+  }, [recordingAction])
 
   if (!window.electronAPI?.getShortcuts) return null
 
-  const items = Object.keys(defaultShortcuts) as ShortcutAction[]
+  const saving = Boolean(recordingAction) && recordingPhase === 'saving'
 
   const resetDefaults = async () => {
     if (!window.electronAPI?.resetShortcuts) return
@@ -80,12 +86,9 @@ export default function GlobalShortcutsEditor() {
     setResetting(true)
     try {
       const res = await window.electronAPI.resetShortcuts()
-      if (!res.ok) {
-        useInterviewStore.getState().setToastMessage(res.error || '重置失败')
-      } else {
-        setShortcuts(res.shortcuts as Record<string, any>)
-        useInterviewStore.getState().setToastMessage('已恢复默认快捷键')
-      }
+      useInterviewStore.getState().setToastMessage(
+        res.ok === true ? res.warning || '已恢复默认快捷键' : res.error || '重置失败',
+      )
     } catch (err) {
       useInterviewStore.getState().setToastMessage(err instanceof Error ? err.message : '重置失败')
     } finally {
@@ -103,6 +106,7 @@ export default function GlobalShortcutsEditor() {
   const statusLabel = (status?: string) => {
     if (status === 'registered') return '已注册'
     if (status === 'failed') return '注册失败'
+    if (status === 'unbound') return '未绑定'
     return '待注册'
   }
 
@@ -110,14 +114,12 @@ export default function GlobalShortcutsEditor() {
     <Section title="全局快捷键" keywords="hotkey shortcut 快捷键 alt ctrl cmd shift 截图">
       <div className="bg-bg-tertiary/30 rounded-lg p-3 text-xs text-text-muted leading-relaxed">
         必须以 <code className="px-1 py-0.5 rounded bg-bg-tertiary border border-bg-hover font-mono text-[11px]">⌘/Ctrl</code> 开头，可叠加 <code className="px-1 py-0.5 rounded bg-bg-tertiary border border-bg-hover font-mono text-[11px]">⇧Shift</code>、<code className="px-1 py-0.5 rounded bg-bg-tertiary border border-bg-hover font-mono text-[11px]">⌥Alt</code>。
-        支持字母、数字、Enter、方向键和常用符号。点击某项后直接按新快捷键，<code className="px-1 py-0.5 rounded bg-bg-tertiary border border-bg-hover font-mono text-[11px]">Esc</code> 取消。
+        支持字母、数字、方向键等。点击某项后按新快捷键，<code className="px-1 py-0.5 rounded bg-bg-tertiary border border-bg-hover font-mono text-[11px]">Esc</code> 取消。系统或其他应用占用的组合键可能无法录入。
       </div>
       <div className="space-y-2">
-        {items.map((action) => {
-          const shortcut = shortcuts[action]
-          if (!shortcut) return null
+        {Object.values(shortcuts).map((shortcut) => {
+          const { action } = shortcut
           const isRecording = recordingAction === action
-          const isSaving = savingAction === action
           return (
             <div
               key={action}
@@ -131,19 +133,20 @@ export default function GlobalShortcutsEditor() {
               </div>
               <button
                 type="button"
-                disabled={isSaving}
-                onClick={() => setRecordingAction(isRecording ? null : action)}
+                disabled={saving || resetting}
+                onClick={() => {
+                  setRecordingPhase('preparing')
+                  setRecordingAction(isRecording ? null : action)
+                }}
                 className={`min-w-[120px] rounded-lg border px-3 py-2 text-xs font-medium transition-colors ${
                   isRecording
                     ? 'border-accent-blue bg-accent-blue/10 text-accent-blue animate-pulse'
                     : 'border-bg-hover bg-bg-tertiary text-text-primary hover:border-accent-blue/40'
                 }`}
               >
-                {isSaving
-                  ? '保存中…'
-                  : isRecording
-                    ? '按下新快捷键…'
-                    : getShortcutDisplay(shortcut.key)}
+                {isRecording
+                  ? { preparing: '准备录键…', ready: '按下新快捷键…', saving: '保存中…' }[recordingPhase]
+                  : getShortcutDisplay(shortcut)}
               </button>
             </div>
           )
@@ -151,7 +154,7 @@ export default function GlobalShortcutsEditor() {
       </div>
       <button
         type="button"
-        disabled={resetting}
+        disabled={resetting || Boolean(recordingAction)}
         onClick={resetDefaults}
         className="w-full py-2.5 text-xs font-medium rounded-xl border border-bg-hover text-text-secondary hover:text-text-primary hover:bg-bg-tertiary transition-colors disabled:opacity-50"
       >
