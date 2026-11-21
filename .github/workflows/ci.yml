@@ -44,7 +44,8 @@ jobs:
   backend:
     needs: changes
     if: needs.changes.outputs.backend == 'true'
-    runs-on: ubuntu-latest
+    # PortAudio initialization on the headless runner is verified on Ubuntu 24.04.
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: backend
@@ -149,7 +150,8 @@ jobs:
   e2e-playwright:
     needs: [changes, frontend]
     if: needs.changes.outputs.frontend == 'true'
-    runs-on: ubuntu-latest
+    # Playwright 1.58 cannot install Chromium dependencies on Ubuntu 26.04.
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: frontend
@@ -217,7 +219,7 @@ jobs:
   e2e-visual:
     needs: [changes, frontend]
     if: needs.changes.outputs.frontend == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: frontend
@@ -276,7 +278,7 @@ jobs:
       needs.backend.result != 'cancelled' &&
       needs.frontend.result != 'failure' &&
       needs.frontend.result != 'cancelled'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
 
     steps:
